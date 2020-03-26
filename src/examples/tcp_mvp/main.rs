@@ -1,4 +1,5 @@
-use rafted::samplelib::Connections;
+mod connections;
+use connections::Connections;
 
 use libc;
 use std::cmp::min;
@@ -45,6 +46,9 @@ fn main() {
 				if result < 0 {
 					panic!("poll error: {}", Error::last_os_error());
 				} else if result > 0 {
+					// TODO: we can probably use result to reduce the amount of time spent looking for
+					// readable sockets, but probably too little to matter
+
 					// listener
 					match listener.accept() {
 						Ok((stream, addr)) => {
@@ -66,7 +70,7 @@ fn main() {
 					connections.act_on_connections(
 						// other nodes
 						|stream| {
-							let mut buf: Vec<u8> = vec![];
+							let mut buf: Vec<u8> = vec![]; // TODO: probably have management of streams -> buffers be its own struct
 							match stream.read_to_end(&mut buf) {
 								Ok(_) => {
 									println!("node: {:?}", buf);

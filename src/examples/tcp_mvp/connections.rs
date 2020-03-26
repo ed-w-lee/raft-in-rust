@@ -1,4 +1,10 @@
-use crate::NodeId;
+/**
+ * Maintains information on how to translate between file descriptors and TcpStreams.
+ * It also maintains a distinction between clients and other raft nodes.
+ * Admittedly, many places for optimization, but I'll ignore that for in an attempt
+ * to get the logic done.
+ */
+use rafted::NodeId;
 
 use libc::{self, POLLIN};
 use std::collections::HashMap;

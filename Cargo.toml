@@ -8,3 +8,7 @@ edition = "2018"
 
 [dependencies]
 libc = "0.2.68"
+
+[[example]]
+name = "tcp_mvp"
+path = "src/examples/tcp_mvp/main.rs"

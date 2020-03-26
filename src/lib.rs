@@ -1,6 +1,5 @@
 mod node;
 mod rpc;
-pub mod samplelib;
 mod types;
 
 pub use crate::node::*;

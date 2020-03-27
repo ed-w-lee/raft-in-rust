@@ -1,8 +1,13 @@
 /**
- * Maintains information on how to translate between file descriptors and TcpStreams.
+ * Maintains information on how to translate between sockets and messages.
  * It also maintains a distinction between clients and other raft nodes.
+ *
+ * --- Notes ---
  * Admittedly, many places for optimization, but I'll ignore that for in an attempt
  * to get the logic done.
+ * May be interesting to add in FSM-like behavior to prevent getting messages before
+ * polling, only being able to poll once fds are regenerated, etc. I tried doing that
+ * but it got too complicated imo.
  */
 use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
 
@@ -18,7 +23,7 @@ use std::ptr::{copy, drop_in_place};
 
 const MAX_FDS: usize = 900;
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone)]
+#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
 pub struct NodeAddr {
 	addr: SocketAddr,
 }
@@ -28,7 +33,7 @@ impl NodeAddr {
 	}
 }
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone)]
+#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
 pub struct ClientAddr {
 	addr: SocketAddr,
 }
@@ -38,16 +43,12 @@ impl ClientAddr {
 	}
 }
 
-pub struct NoUpdates;
-pub struct NodeUpdated {
-	node_updated: bool,
-}
-pub struct ClientUpdated {
+pub struct ConnUpdates {
 	node_updated: bool,
 	client_updated: bool,
 }
 
-pub struct Connections<S, M> {
+pub struct Connections<M> {
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
@@ -57,16 +58,16 @@ pub struct Connections<S, M> {
 	client_parse: Box<dyn ClientParse<TcpStream, M>>,
 	client_fds: HashMap<RawFd, (bool, ClientAddr)>,
 	client_streams: HashMap<ClientAddr, TcpStream>,
-	updates: S,
+	updates: ConnUpdates,
 }
 
 // TODO: maybe investigate lifetimes to keep track of RawFds?
-impl<M> Connections<NoUpdates, M> {
+impl<M> Connections<M> {
 	pub fn new(
 		listener: &TcpListener,
 		node_parse: Box<dyn NodeParse<TcpStream>>,
 		client_parse: Box<dyn ClientParse<TcpStream, M>>,
-	) -> Connections<NoUpdates, M> {
+	) -> Connections<M> {
 		Connections {
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
@@ -81,15 +82,20 @@ impl<M> Connections<NoUpdates, M> {
 			client_parse,
 			client_fds: HashMap::new(),
 			client_streams: HashMap::new(),
-			updates: NoUpdates,
+			updates: ConnUpdates {
+				node_updated: false,
+				client_updated: false,
+			},
 		}
 	}
 
 	pub fn poll(&mut self, timeout: i32) -> i32 {
 		println!(
-			"last pollfd {{ fd: {}, events: {} }}",
+			"poll status: \n\tlast pollfd {{ fd: {}, events: {} }}\n\tnode fds: {}, client fds: {}",
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
-			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
+			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events,
+			self.node_fds.len(),
+			self.client_fds.len()
 		);
 		unsafe { libc::poll(self.pollfds[0].as_mut_ptr(), self.curr_len as u64, timeout) }
 	}
@@ -136,7 +142,7 @@ impl<M> Connections<NoUpdates, M> {
 		self.client_streams.insert(addr, stream);
 	}
 
-	pub fn get_node_msgs(mut self) -> (Connections<NodeUpdated, M>, HashMap<NodeAddr, Vec<Message>>) {
+	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
@@ -172,6 +178,7 @@ impl<M> Connections<NoUpdates, M> {
 					self.node_streams.remove_entry(&addr_to_rem);
 				}
 				ParseStatus::Done => {
+					// node somehow hit EOF, this shouldn't happen so we clean up connection
 					node_updated = true;
 					let addr_to_rem = addr.clone();
 					self.node_fds.remove_entry(&stream.as_raw_fd());
@@ -180,33 +187,10 @@ impl<M> Connections<NoUpdates, M> {
 			}
 		}
 
-		(
-			Connections {
-				pollfds: self.pollfds,
-				node_end: self.node_end,
-				curr_len: self.curr_len,
-				node_parse: self.node_parse,
-				node_fds: self.node_fds,
-				node_streams: self.node_streams,
-				client_parse: self.client_parse,
-				client_fds: self.client_fds,
-				client_streams: self.client_streams,
-				updates: NodeUpdated { node_updated },
-			},
-			msg_map,
-		)
+		self.updates.node_updated = node_updated;
+		msg_map
 	}
 
-	pub fn send_node_msg(&mut self, addr: NodeAddr, msg: Message) {
-		unimplemented!()
-	}
-
-	pub fn send_client_msg(&mut self, addr: ClientAddr, msg: Message) {
-		unimplemented!()
-	}
-}
-
-impl<M> Connections<NodeUpdated, M> {
 	pub fn get_client_msgs(&mut self) -> HashMap<ClientAddr, Vec<M>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.node_end..self.curr_len]
 			.iter()
@@ -214,7 +198,7 @@ impl<M> Connections<NodeUpdated, M> {
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		println!("nodes polled successfully: {}", pfds_to_read.len());
+		println!("clients polled successfully: {}", pfds_to_read.len());
 
 		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
 		let mut client_updated = false;
@@ -222,7 +206,7 @@ impl<M> Connections<NodeUpdated, M> {
 			let tup = self
 				.client_fds
 				.get(&pfd.fd)
-				.expect("unexpected key for node_fds");
+				.expect("unexpected key for client_fds");
 			let should_track = tup.0;
 			assert_eq!(should_track, true);
 
@@ -230,7 +214,7 @@ impl<M> Connections<NodeUpdated, M> {
 			let stream = self
 				.client_streams
 				.get_mut(&addr)
-				.expect("unexpected key for node_streams");
+				.expect("unexpected key for client_streams");
 
 			let tup = self.client_parse.parse(&addr, stream);
 			let msgs = tup.0;
@@ -241,46 +225,72 @@ impl<M> Connections<NodeUpdated, M> {
 				ParseStatus::Waiting => {}
 				ParseStatus::Unexpected(err) => {
 					client_updated = true;
-					println!("unexpected parse error: {}", err);
-					stream.write(b"parser error");
+					println!("unexpected parse error --- {}", err);
+					stream
+						.write(b"parser error")
+						.expect("writing fucked up lol");
 
+					// disconnect
 					let addr_to_rem = addr.clone();
 					self.client_fds.remove_entry(&stream.as_raw_fd());
 					self.client_streams.remove_entry(&addr_to_rem);
 				}
 				ParseStatus::Done => {
+					println!("mark connection as shouldn't poll");
 					client_updated = true;
-					let addr_to_rem = addr.clone();
+					// mark that we shouldn't poll anymore (we may still want to send things to them later)
 					let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
 					tup.0 = false;
-					assert_eq!(self.client_fds.get(&pfd.fd).unwrap().0, false);
 				}
 			}
 		}
 
-		unimplemented!()
+		self.updates.client_updated = client_updated;
+		msg_map
 	}
 
-	pub fn unregister_client_conns(
-		mut self,
-		addrs: Vec<ClientAddr>,
-	) -> Connections<ClientUpdated, M> {
-		unimplemented!()
-		// Connections {
-		// 	pollfds: self.pollfds,
-		// 	node_end: self.node_end,
-		// 	curr_len: self.curr_len,
-		// 	node_fds: self.node_fds,
-		// 	node_streams: self.node_streams,
-		// 	client_fds: self.client_fds,
-		// 	client_streams: self.client_streams,
-		// 	updates: NodeUpdated { node_updated },
-		// }
+	pub fn send_node_msg(&mut self, addr: &NodeAddr, msg: Message) {
+		match self.node_streams.get_mut(addr) {
+			// FIXME: convert msg to string
+			Some(stream) => match stream.write_all(b"blah") {
+				Ok(_) => {
+					println!("wrote message to node: {:?}", addr.addr);
+				}
+				Err(_) => {
+					println!("writing fucked up with node: {:?}", addr.addr);
+					self.node_fds.remove_entry(&stream.as_raw_fd());
+					self.node_streams.remove_entry(addr);
+					self.updates.node_updated = true;
+				}
+			},
+			None => panic!("unable to find key for node_streams"),
+		}
 	}
-}
 
-impl<M> Connections<ClientUpdated, M> {
-	pub fn regenerate_pollfds(mut self) -> Connections<NoUpdates, M> {
+	pub fn send_client(&mut self, addr: &ClientAddr, msg: &String) {
+		match self.client_streams.get_mut(addr) {
+			Some(stream) => {
+				match stream.write_all(msg.as_bytes()) {
+					Ok(_) => {
+						println!("wrote msg to stream");
+					}
+					Err(_) => {
+						println!("writing fucked up woops");
+					}
+				};
+				if !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
+					println!("tear down connection");
+					self.client_fds.remove_entry(&stream.as_raw_fd());
+					self.client_streams.remove_entry(addr);
+
+					self.updates.client_updated = true;
+				}
+			}
+			None => panic!("unable to find key for client_streams"),
+		}
+	}
+
+	pub fn regenerate_pollfds(&mut self) {
 		match (self.updates.client_updated, self.updates.node_updated) {
 			(false, false) => {
 				println!("no regeneration");
@@ -344,18 +354,10 @@ impl<M> Connections<ClientUpdated, M> {
 				}
 			}
 		}
-		Connections {
-			pollfds: self.pollfds,
-			node_end: self.node_end,
-			curr_len: self.curr_len,
-			node_parse: self.node_parse,
-			node_fds: self.node_fds,
-			node_streams: self.node_streams,
-			client_parse: self.client_parse,
-			client_fds: self.client_fds,
-			client_streams: self.client_streams,
-			updates: NoUpdates,
-		}
+		self.updates = ConnUpdates {
+			client_updated: false,
+			node_updated: false,
+		};
 	}
 
 	fn _get_clients_to_poll(&self) -> Vec<libc::pollfd> {

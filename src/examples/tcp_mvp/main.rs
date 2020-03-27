@@ -65,15 +65,17 @@ fn main() {
 					}
 
 					// handle messages from nodes first
-					let tup = conn_manager.get_node_msgs();
-					let mut node_updated = tup.0;
-					let node_msgs = tup.1;
+					let node_msgs = conn_manager.get_node_msgs();
 
 					// then handle messages from clients
-					let client_msgs = node_updated.get_client_msgs();
-					let client_updated = node_updated.unregister_client_conns(Vec::new());
+					let client_msgs = conn_manager.get_client_msgs();
+					thread::sleep(Duration::from_millis(1000));
+					client_msgs.iter().for_each(|(k, v)| {
+						println!("client: {:?}, msgs: {:?}", k, v);
+						conn_manager.send_client(k, &format!("{:?}\n", v));
+					});
 
-					conn_manager = client_updated.regenerate_pollfds();
+					conn_manager.regenerate_pollfds();
 				}
 				deadline = Instant::now()
 					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))

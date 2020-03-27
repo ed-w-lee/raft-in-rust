@@ -1,12 +1,15 @@
 mod connections;
-use connections::Connections;
+mod msgparse;
+use connections::{ClientAddr, Connections, NodeAddr};
+use msgparse::{ClientParser, NodeParser, ParseStatus};
 
 use libc;
 use std::cmp::min;
 use std::io;
 use std::io::prelude::*;
 use std::io::Error;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +28,9 @@ fn main() {
 		.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
 		.unwrap();
 
-	let mut connections = Connections::new(&listener);
+	let n_parser: NodeParser<TcpStream> = NodeParser::new();
+	let c_parser: ClientParser<TcpStream, i32> = ClientParser::new();
+	let mut conn_manager = Connections::new(&listener, Box::new(n_parser), Box::new(c_parser));
 
 	loop {
 		thread::sleep(Duration::from_secs(1));
@@ -33,15 +38,7 @@ fn main() {
 		match deadline.checked_duration_since(Instant::now()) {
 			Some(timeout) => {
 				println!("time til election timeout: {:?}", timeout);
-				let tup = connections.get_pollfds();
-				println!("num to poll: {}", tup.1);
-				let result = unsafe {
-					libc::poll(
-						tup.0,
-						tup.1 as u64,
-						min(ELECTION_TIMEOUT as i32, timeout.as_millis() as i32),
-					)
-				};
+				let result = conn_manager.poll(min(ELECTION_TIMEOUT as i32, timeout.as_millis() as i32));
 				println!("result: {}", result);
 				if result < 0 {
 					panic!("poll error: {}", Error::last_os_error());
@@ -56,9 +53,9 @@ fn main() {
 								.set_nonblocking(true)
 								.expect("stream.set_nonblocking failed");
 							if other_addrs.contains(&addr) {
-								connections.register_other(addr, stream);
+								conn_manager.register_node(NodeAddr::new(addr), stream);
 							} else {
-								connections.register_client(stream);
+								conn_manager.register_client(ClientAddr::new(addr), stream);
 							}
 						}
 						Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -67,38 +64,16 @@ fn main() {
 						Err(e) => panic!("encountered IO error: {}", e),
 					}
 
-					connections.act_on_connections(
-						// other nodes
-						|stream| {
-							let mut buf: Vec<u8> = vec![]; // TODO: probably have management of streams -> buffers be its own struct
-							match stream.read_to_end(&mut buf) {
-								Ok(_) => {
-									println!("node: {:?}", buf);
-									true // somehow hit EOF, we should drop connection
-								}
-								Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-									println!("node: {:?}", buf);
-									false // connection still up, don't delete
-								}
-								Err(e) => panic!("encountered IO error: {}", e),
-							}
-						},
-						// client nodes
-						|stream| {
-							let mut buf: Vec<u8> = vec![];
-							match stream.read_to_end(&mut buf) {
-								Ok(_) => {
-									println!("client: {:?}", buf);
-									true // done with client node, stop polling
-								}
-								Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-									println!("client: {:?}", buf);
-									false
-								}
-								Err(e) => panic!("encountered IO error: {}", e),
-							}
-						},
-					);
+					// handle messages from nodes first
+					let tup = conn_manager.get_node_msgs();
+					let mut node_updated = tup.0;
+					let node_msgs = tup.1;
+
+					// then handle messages from clients
+					let client_msgs = node_updated.get_client_msgs();
+					let client_updated = node_updated.unregister_client_conns(Vec::new());
+
+					conn_manager = client_updated.regenerate_pollfds();
 				}
 				deadline = Instant::now()
 					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))

@@ -4,10 +4,13 @@
  * Admittedly, many places for optimization, but I'll ignore that for in an attempt
  * to get the logic done.
  */
-use rafted::NodeId;
+use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
+
+use rafted::Message;
 
 use libc::{self, POLLIN};
 use std::collections::HashMap;
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -15,73 +18,113 @@ use std::ptr::{copy, drop_in_place};
 
 const MAX_FDS: usize = 900;
 
-pub struct Connections {
+#[derive(Hash, PartialEq, Eq, Copy, Clone)]
+pub struct NodeAddr {
+	addr: SocketAddr,
+}
+impl NodeAddr {
+	pub fn new(addr: SocketAddr) -> NodeAddr {
+		NodeAddr { addr }
+	}
+}
+
+#[derive(Hash, PartialEq, Eq, Copy, Clone)]
+pub struct ClientAddr {
+	addr: SocketAddr,
+}
+impl ClientAddr {
+	pub fn new(addr: SocketAddr) -> ClientAddr {
+		ClientAddr { addr }
+	}
+}
+
+pub struct NoUpdates;
+pub struct NodeUpdated {
+	node_updated: bool,
+}
+pub struct ClientUpdated {
+	node_updated: bool,
+	client_updated: bool,
+}
+
+pub struct Connections<S, M> {
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
-	other_end: usize,
+	node_end: usize,
 	curr_len: usize,
-	other_fds: HashMap<RawFd, NodeId>,
-	other_streams: HashMap<NodeId, TcpStream>,
-	client_fds: HashMap<RawFd, (bool, TcpStream)>,
+	node_parse: Box<dyn NodeParse<TcpStream>>,
+	node_fds: HashMap<RawFd, NodeAddr>,
+	node_streams: HashMap<NodeAddr, TcpStream>,
+	client_parse: Box<dyn ClientParse<TcpStream, M>>,
+	client_fds: HashMap<RawFd, (bool, ClientAddr)>,
+	client_streams: HashMap<ClientAddr, TcpStream>,
+	updates: S,
 }
 
 // TODO: maybe investigate lifetimes to keep track of RawFds?
-impl Connections {
-	pub fn new(listener: &TcpListener) -> Connections {
+impl<M> Connections<NoUpdates, M> {
+	pub fn new(
+		listener: &TcpListener,
+		node_parse: Box<dyn NodeParse<TcpStream>>,
+		client_parse: Box<dyn ClientParse<TcpStream, M>>,
+	) -> Connections<NoUpdates, M> {
 		Connections {
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
-				*(&mut data[0]) = MaybeUninit::new(Connections::pollfd(listener.as_raw_fd()));
+				*(&mut data[0]) = MaybeUninit::new(pollfd(listener.as_raw_fd()));
 				data
 			},
-			other_end: 1,
+			node_end: 1,
 			curr_len: 1,
-			other_fds: HashMap::new(),
-			other_streams: HashMap::new(),
+			node_parse,
+			node_fds: HashMap::new(),
+			node_streams: HashMap::new(),
+			client_parse,
 			client_fds: HashMap::new(),
+			client_streams: HashMap::new(),
+			updates: NoUpdates,
 		}
 	}
 
-	pub fn get_pollfds(&mut self) -> (*mut libc::pollfd, usize) {
+	pub fn poll(&mut self, timeout: i32) -> i32 {
 		println!(
 			"last pollfd {{ fd: {}, events: {} }}",
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
 		);
-		(self.pollfds[0].as_mut_ptr(), self.curr_len)
+		unsafe { libc::poll(self.pollfds[0].as_mut_ptr(), self.curr_len as u64, timeout) }
 	}
 
-	pub fn register_other(&mut self, addr: SocketAddr, stream: TcpStream) {
+	pub fn register_node(&mut self, addr: NodeAddr, stream: TcpStream) {
 		if self.curr_len + 1 >= MAX_FDS {
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
 		// shift over any client pollfds
-		if self.other_end < self.curr_len {
+		if self.node_end < self.curr_len {
 			unsafe {
 				copy(
-					self.pollfds[self.other_end].as_ptr(),
-					self.pollfds[self.other_end + 1].as_mut_ptr(),
-					self.curr_len - self.other_end,
+					self.pollfds[self.node_end].as_ptr(),
+					self.pollfds[self.node_end + 1].as_mut_ptr(),
+					self.curr_len - self.node_end,
 				)
 			}
 		}
 
-		// insert other pollfd
-		*(&mut self.pollfds[self.other_end]) =
-			MaybeUninit::new(Connections::pollfd(stream.as_raw_fd()));
-		self.other_end += 1;
+		// insert node pollfd
+		*(&mut self.pollfds[self.node_end]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
+		self.node_end += 1;
 		self.curr_len += 1;
 
-		self.other_fds.insert(stream.as_raw_fd(), addr);
-		self.other_streams.insert(addr, stream);
+		self.node_fds.insert(stream.as_raw_fd(), addr);
+		self.node_streams.insert(addr, stream);
 	}
 
-	pub fn register_client(&mut self, stream: TcpStream) {
+	pub fn register_client(&mut self, addr: ClientAddr, stream: TcpStream) {
 		if self.curr_len + 1 >= MAX_FDS {
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		*(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(Connections::pollfd(stream.as_raw_fd()));
+		*(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
 		self.curr_len += 1;
 		println!(
 			"registered client: pollfd {{ fd: {}, events: {} }}",
@@ -89,120 +132,196 @@ impl Connections {
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
 		);
 
-		self.client_fds.insert(stream.as_raw_fd(), (true, stream));
+		self.client_fds.insert(stream.as_raw_fd(), (true, addr));
+		self.client_streams.insert(addr, stream);
 	}
 
-	pub fn act_on_connections(
-		&mut self,
-		f_others: impl FnMut(&mut TcpStream) -> bool,
-		f_clients: impl FnMut(&mut TcpStream) -> bool,
-	) {
-		let others_updated = self._act_on_others(f_others);
-		let client_updated = self._act_on_clients(f_clients);
-		self._regenerate_pollfds(client_updated, others_updated);
-	}
-
-	fn _act_on_others(&mut self, mut f: impl FnMut(&mut TcpStream) -> bool) -> bool {
-		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.other_end]
+	pub fn get_node_msgs(mut self) -> (Connections<NodeUpdated, M>, HashMap<NodeAddr, Vec<Message>>) {
+		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
-			.filter(|pfd| {
-				println!("other: {}", pfd.revents);
-				pfd.revents & POLLIN != 0
-			})
+			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		println!("others polled successfully: {}", pfds_to_read.len());
+		println!("nodes polled successfully: {}", pfds_to_read.len());
 
-		let mut fds_to_delete: Vec<RawFd> = Vec::new();
+		let mut msg_map: HashMap<NodeAddr, Vec<Message>> = HashMap::new();
+		let mut node_updated = false;
 		for pfd in pfds_to_read {
-			let addr = self.other_fds.get(&pfd.fd).unwrap();
-			if let Some(stream) = self.other_streams.get_mut(addr) {
-				if f(stream) {
-					fds_to_delete.push(stream.as_raw_fd());
+			let addr = self
+				.node_fds
+				.get(&pfd.fd)
+				.expect("unexpected key for node_fds");
+			let stream = self
+				.node_streams
+				.get_mut(addr)
+				.expect("unexpected key for node_streams");
+
+			let tup = self.node_parse.parse(addr, stream);
+			let msgs = tup.0;
+			msg_map.insert(addr.clone(), msgs);
+
+			let status = tup.1;
+			match status {
+				ParseStatus::Waiting => {}
+				ParseStatus::Unexpected(err) => {
+					node_updated = true;
+					println!("unexpected parse error: {}", err);
+					let addr_to_rem = addr.clone();
+					self.node_fds.remove_entry(&stream.as_raw_fd());
+					self.node_streams.remove_entry(&addr_to_rem);
+				}
+				ParseStatus::Done => {
+					node_updated = true;
+					let addr_to_rem = addr.clone();
+					self.node_fds.remove_entry(&stream.as_raw_fd());
+					self.node_streams.remove_entry(&addr_to_rem);
 				}
 			}
 		}
 
-		let updated = fds_to_delete.len() > 0;
-
-		for fd in fds_to_delete {
-			let addr = self.other_fds.get(&fd).unwrap();
-			self.other_streams.remove_entry(&addr);
-			self.other_fds.remove_entry(&fd);
-		}
-
-		updated
+		(
+			Connections {
+				pollfds: self.pollfds,
+				node_end: self.node_end,
+				curr_len: self.curr_len,
+				node_parse: self.node_parse,
+				node_fds: self.node_fds,
+				node_streams: self.node_streams,
+				client_parse: self.client_parse,
+				client_fds: self.client_fds,
+				client_streams: self.client_streams,
+				updates: NodeUpdated { node_updated },
+			},
+			msg_map,
+		)
 	}
 
-	fn _act_on_clients(&mut self, mut f: impl FnMut(&mut TcpStream) -> bool) -> bool {
-		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.other_end..self.curr_len]
+	pub fn send_node_msg(&mut self, addr: NodeAddr, msg: Message) {
+		unimplemented!()
+	}
+
+	pub fn send_client_msg(&mut self, addr: ClientAddr, msg: Message) {
+		unimplemented!()
+	}
+}
+
+impl<M> Connections<NodeUpdated, M> {
+	pub fn get_client_msgs(&mut self) -> HashMap<ClientAddr, Vec<M>> {
+		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.node_end..self.curr_len]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
-			.filter(|pfd| {
-				println!("client: {}", pfd.revents);
-				pfd.revents & POLLIN != 0
-			})
+			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		println!("clients polled successfully: {}", pfds_to_read.len());
+		println!("nodes polled successfully: {}", pfds_to_read.len());
 
-		let mut updated = false;
+		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
+		let mut client_updated = false;
 		for pfd in pfds_to_read {
-			let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
-			if tup.0 {
-				let to_ignore = f(&mut tup.1);
-				if to_ignore {
+			let tup = self
+				.client_fds
+				.get(&pfd.fd)
+				.expect("unexpected key for node_fds");
+			let should_track = tup.0;
+			assert_eq!(should_track, true);
+
+			let addr = tup.1;
+			let stream = self
+				.client_streams
+				.get_mut(&addr)
+				.expect("unexpected key for node_streams");
+
+			let tup = self.client_parse.parse(&addr, stream);
+			let msgs = tup.0;
+			msg_map.insert(addr.clone(), msgs);
+
+			let status = tup.1;
+			match status {
+				ParseStatus::Waiting => {}
+				ParseStatus::Unexpected(err) => {
+					client_updated = true;
+					println!("unexpected parse error: {}", err);
+					stream.write(b"parser error");
+
+					let addr_to_rem = addr.clone();
+					self.client_fds.remove_entry(&stream.as_raw_fd());
+					self.client_streams.remove_entry(&addr_to_rem);
+				}
+				ParseStatus::Done => {
+					client_updated = true;
+					let addr_to_rem = addr.clone();
+					let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
 					tup.0 = false;
-					updated = true;
+					assert_eq!(self.client_fds.get(&pfd.fd).unwrap().0, false);
 				}
 			}
 		}
-		updated
+
+		unimplemented!()
 	}
 
-	fn _regenerate_pollfds(&mut self, client_updated: bool, others_updated: bool) {
-		match (client_updated, others_updated) {
+	pub fn unregister_client_conns(
+		mut self,
+		addrs: Vec<ClientAddr>,
+	) -> Connections<ClientUpdated, M> {
+		unimplemented!()
+		// Connections {
+		// 	pollfds: self.pollfds,
+		// 	node_end: self.node_end,
+		// 	curr_len: self.curr_len,
+		// 	node_fds: self.node_fds,
+		// 	node_streams: self.node_streams,
+		// 	client_fds: self.client_fds,
+		// 	client_streams: self.client_streams,
+		// 	updates: NodeUpdated { node_updated },
+		// }
+	}
+}
+
+impl<M> Connections<ClientUpdated, M> {
+	pub fn regenerate_pollfds(mut self) -> Connections<NoUpdates, M> {
+		match (self.updates.client_updated, self.updates.node_updated) {
 			(false, false) => {
 				println!("no regeneration");
 			}
 			(true, false) => {
-				// only client -> regenerate client, don't touch other
-				for i in self.other_end..self.curr_len {
+				// only client -> regenerate client, don't touch node
+				for i in self.node_end..self.curr_len {
 					unsafe { drop_in_place(self.pollfds[i].as_mut_ptr()) };
 				}
 				let clients = self._get_clients_to_poll();
 				// copy clients into end of pollfds
-				self.curr_len = self.other_end + clients.len();
-				for i in self.other_end..self.curr_len {
-					*(&mut self.pollfds[i]) = MaybeUninit::new(clients[i - self.other_end]);
+				self.curr_len = self.node_end + clients.len();
+				for i in self.node_end..self.curr_len {
+					*(&mut self.pollfds[i]) = MaybeUninit::new(clients[i - self.node_end]);
 				}
 			}
 			(false, true) => {
-				// only other -> regenerate other, move client over
-				for i in 1..self.other_end {
+				// only node -> regenerate node, move client over
+				for i in 1..self.node_end {
 					unsafe { drop_in_place(self.pollfds[i].as_mut_ptr()) };
 				}
 
-				let others = self._get_others_to_poll();
-				let new_other_end = 1 + others.len();
+				let nodes = self._get_nodes_to_poll();
+				let new_node_end = 1 + nodes.len();
 
 				// shift over any client pollfds
-				if self.other_end < self.curr_len {
+				if self.node_end < self.curr_len {
 					unsafe {
 						copy(
-							self.pollfds[self.other_end].as_ptr(),
-							self.pollfds[new_other_end].as_mut_ptr(),
-							self.curr_len - self.other_end,
+							self.pollfds[self.node_end].as_ptr(),
+							self.pollfds[new_node_end].as_mut_ptr(),
+							self.curr_len - self.node_end,
 						)
 					}
 				}
 
-				// copy others into pollfds
-				self.curr_len = (self.curr_len + new_other_end) - self.other_end;
-				self.other_end = new_other_end;
-				for i in 1..self.other_end {
-					*(&mut self.pollfds[i]) = MaybeUninit::new(others[i - 1]);
+				// copy nodes into pollfds
+				self.curr_len = (self.curr_len + new_node_end) - self.node_end;
+				self.node_end = new_node_end;
+				for i in 1..self.node_end {
+					*(&mut self.pollfds[i]) = MaybeUninit::new(nodes[i - 1]);
 				}
 			}
 			(true, true) => {
@@ -212,18 +331,30 @@ impl Connections {
 				}
 
 				let clients = self._get_clients_to_poll();
-				let others = self._get_others_to_poll();
+				let nodes = self._get_nodes_to_poll();
 
-				self.other_end = 1 + others.len();
-				self.curr_len = self.other_end + clients.len();
+				self.node_end = 1 + nodes.len();
+				self.curr_len = self.node_end + clients.len();
 
-				for i in 0..others.len() {
-					*(&mut self.pollfds[i + 1]) = MaybeUninit::new(others[i]);
+				for i in 0..nodes.len() {
+					*(&mut self.pollfds[i + 1]) = MaybeUninit::new(nodes[i]);
 				}
 				for i in 0..clients.len() {
-					*(&mut self.pollfds[i + self.other_end]) = MaybeUninit::new(clients[i]);
+					*(&mut self.pollfds[i + self.node_end]) = MaybeUninit::new(clients[i]);
 				}
 			}
+		}
+		Connections {
+			pollfds: self.pollfds,
+			node_end: self.node_end,
+			curr_len: self.curr_len,
+			node_parse: self.node_parse,
+			node_fds: self.node_fds,
+			node_streams: self.node_streams,
+			client_parse: self.client_parse,
+			client_fds: self.client_fds,
+			client_streams: self.client_streams,
+			updates: NoUpdates,
 		}
 	}
 
@@ -233,24 +364,24 @@ impl Connections {
 			.iter()
 			.filter(|(_k, v)| v.0)
 			.map(|(k, _v)| k)
-			.map(|&k| Connections::pollfd(k))
+			.map(|&k| pollfd(k))
 			.collect()
 	}
 
-	fn _get_others_to_poll(&self) -> Vec<libc::pollfd> {
+	fn _get_nodes_to_poll(&self) -> Vec<libc::pollfd> {
 		self
-			.other_fds
+			.node_fds
 			.iter()
 			.map(|(k, _v)| k)
-			.map(|&k| Connections::pollfd(k))
+			.map(|&k| pollfd(k))
 			.collect()
 	}
+}
 
-	fn pollfd(fd: RawFd) -> libc::pollfd {
-		libc::pollfd {
-			fd,
-			events: POLLIN,
-			revents: 0,
-		}
+fn pollfd(fd: RawFd) -> libc::pollfd {
+	libc::pollfd {
+		fd,
+		events: POLLIN,
+		revents: 0,
 	}
 }

@@ -6,7 +6,7 @@ pub struct AppendEntries {
 	leader_commit: LogIndex,
 	prev_log_index: LogIndex,
 	prev_log_term: Term,
-	entries: Vec<u64>,
+	entries: Vec<u8>, // have the user translate string into list of entries?
 }
 
 pub struct AppendEntriesResponse {

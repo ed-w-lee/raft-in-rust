@@ -1,24 +1,47 @@
 mod connections;
+mod entry;
 mod msgparse;
+mod serialize;
 use connections::{ClientAddr, Connections, NodeAddr};
-use msgparse::{ClientParser, NodeParser, ParseStatus};
+// use entry::Entry;
+use msgparse::{ClientParser, NodeParser};
 
-use libc;
+use rafted::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse};
+
+// use libc;
 use std::cmp::min;
 use std::io;
-use std::io::prelude::*;
+// use std::io::prelude::*;
 use std::io::Error;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::thread;
+use std::net::{IpAddr, SocketAddr, TcpListener};
+// use std::os::unix::io::{AsRawFd, RawFd};
+// use std::thread;
 use std::time::{Duration, Instant};
 
 const ELECTION_TIMEOUT: u64 = 5000;
+pub const LISTEN_PORT: u16 = 4242;
 
 fn main() {
-	let other_addrs = [SocketAddr::from(([127, 0, 0, 1], 8484))];
-	let addrs = [SocketAddr::from(([127, 0, 0, 1], 4242))];
-	let listener = TcpListener::bind(&addrs[..]).unwrap();
+	let ips: Vec<IpAddr> = vec![
+		"127.0.0.11".parse().unwrap(),
+		"127.0.0.21".parse().unwrap(),
+		// "127.0.0.31".parse().unwrap(),
+		// "127.0.0.41".parse().unwrap(),
+		// "127.0.0.51".parse().unwrap(),
+	];
+	let bind_addrs: Vec<SocketAddr> = ips
+		.iter()
+		.map(|addr| SocketAddr::new(addr.clone(), LISTEN_PORT))
+		.collect();
+	let listener = TcpListener::bind(&bind_addrs[..]).unwrap();
+	println!("running on {:?}", listener.local_addr().unwrap());
+
+	let my_addr = listener.local_addr().unwrap().ip();
+	let other_ips: Vec<IpAddr> = ips
+		.iter()
+		.map(|addr| addr.clone())
+		.filter(|&addr| addr != my_addr)
+		.collect();
 
 	listener
 		.set_nonblocking(true)
@@ -28,13 +51,12 @@ fn main() {
 		.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
 		.unwrap();
 
-	let n_parser: NodeParser<TcpStream> = NodeParser::new();
-	let c_parser: ClientParser<TcpStream, i32> = ClientParser::new();
-	let mut conn_manager = Connections::new(&listener, Box::new(n_parser), Box::new(c_parser));
+	let n_parser: NodeParser = NodeParser::new();
+	let c_parser: ClientParser = ClientParser::new();
+	let mut conn_manager: Connections<u64, u64> =
+		Connections::new(my_addr, &listener, Box::new(n_parser), Box::new(c_parser));
 
 	loop {
-		thread::sleep(Duration::from_secs(1));
-
 		match deadline.checked_duration_since(Instant::now()) {
 			Some(timeout) => {
 				println!("time til election timeout: {:?}", timeout);
@@ -52,8 +74,9 @@ fn main() {
 							stream
 								.set_nonblocking(true)
 								.expect("stream.set_nonblocking failed");
-							if other_addrs.contains(&addr) {
-								conn_manager.register_node(NodeAddr::new(addr), stream);
+							let ip = addr.ip();
+							if other_ips.contains(&ip) {
+								conn_manager.register_node(NodeAddr::new(ip), stream);
 							} else {
 								conn_manager.register_client(ClientAddr::new(addr), stream);
 							}
@@ -66,10 +89,22 @@ fn main() {
 
 					// handle messages from nodes first
 					let node_msgs = conn_manager.get_node_msgs();
+					node_msgs.iter().for_each(|(k, v)| {
+						println!("client: {:?}, msgs: {:?}", k, v);
+						let mut to_send = vec![];
+						for msg in v {
+							if let Message::VoteReq(_) = msg {
+								to_send.push(Message::VoteRes(RequestVoteResponse {
+									term: 11,
+									vote_granted: false,
+								}));
+							}
+						}
+						conn_manager.send_node(k, to_send);
+					});
 
 					// then handle messages from clients
 					let client_msgs = conn_manager.get_client_msgs();
-					thread::sleep(Duration::from_millis(1000));
 					client_msgs.iter().for_each(|(k, v)| {
 						println!("client: {:?}, msgs: {:?}", k, v);
 						conn_manager.send_client(k, &format!("{:?}\n", v));
@@ -77,13 +112,23 @@ fn main() {
 
 					conn_manager.regenerate_pollfds();
 				}
-				deadline = Instant::now()
-					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
-					.unwrap();
+				conn_manager.regenerate_pollfds();
 			}
 			None => {
 				// election timeout
-				panic!("election timeout!");
+				conn_manager.send_node(
+					&NodeAddr::new(other_ips[0]),
+					vec![Message::VoteReq(RequestVote {
+						term: 10,
+						candidate_id: my_addr,
+						last_log_index: 20,
+						last_log_term: 30,
+					})],
+				);
+				deadline = Instant::now()
+					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
+					.unwrap();
+				println!("election timeout");
 			}
 		}
 	}

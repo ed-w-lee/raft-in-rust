@@ -9,6 +9,9 @@ edition = "2018"
 [dependencies]
 libc = "0.2.68"
 
+[dev-dependencies]
+net2 = "0.2.33"
+
 [[example]]
 name = "tcp_mvp"
 path = "src/examples/tcp_mvp/main.rs"

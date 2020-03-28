@@ -1,23 +1,16 @@
-/**
- * Maintains information on how to translate between sockets and messages.
- * It also maintains a distinction between clients and other raft nodes.
- *
- * --- Notes ---
- * Admittedly, many places for optimization, but I'll ignore that for in an attempt
- * to get the logic done.
- * May be interesting to add in FSM-like behavior to prevent getting messages before
- * polling, only being able to poll once fds are regenerated, etc. I tried doing that
- * but it got too complicated imo.
- */
+// use crate::entry::Entry;
 use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
+use crate::serialize::Serialize;
+use crate::LISTEN_PORT;
 
 use rafted::Message;
 
 use libc::{self, POLLIN};
+use net2::TcpBuilder;
 use std::collections::HashMap;
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::{copy, drop_in_place};
 
@@ -25,10 +18,10 @@ const MAX_FDS: usize = 900;
 
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
 pub struct NodeAddr {
-	addr: SocketAddr,
+	addr: IpAddr,
 }
 impl NodeAddr {
-	pub fn new(addr: SocketAddr) -> NodeAddr {
+	pub fn new(addr: IpAddr) -> NodeAddr {
 		NodeAddr { addr }
 	}
 }
@@ -48,11 +41,24 @@ pub struct ConnUpdates {
 	client_updated: bool,
 }
 
-pub struct Connections<M> {
+/**
+ * Maintains information on how to translate between sockets and messages.
+ * It also maintains a distinction between clients and other raft nodes.
+ *
+ * --- Notes ---
+ * Admittedly, many places for optimization, but I'll ignore that for in an attempt
+ * to get the logic done.
+ * May be interesting to add in FSM-like behavior to prevent getting messages before
+ * polling, only being able to poll once fds are regenerated, etc. I tried doing that
+ * but it got too complicated imo.
+ */
+pub struct Connections<M, E> {
+	my_addr: IpAddr,
+	next_port: u16,
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
-	node_parse: Box<dyn NodeParse<TcpStream>>,
+	node_parse: Box<dyn NodeParse<TcpStream, E>>,
 	node_fds: HashMap<RawFd, NodeAddr>,
 	node_streams: HashMap<NodeAddr, TcpStream>,
 	client_parse: Box<dyn ClientParse<TcpStream, M>>,
@@ -62,13 +68,19 @@ pub struct Connections<M> {
 }
 
 // TODO: maybe investigate lifetimes to keep track of RawFds?
-impl<M> Connections<M> {
+impl<M, E> Connections<M, E>
+where
+	E: Serialize,
+{
 	pub fn new(
+		my_addr: IpAddr,
 		listener: &TcpListener,
-		node_parse: Box<dyn NodeParse<TcpStream>>,
+		node_parse: Box<dyn NodeParse<TcpStream, E>>,
 		client_parse: Box<dyn ClientParse<TcpStream, M>>,
-	) -> Connections<M> {
+	) -> Connections<M, E> {
 		Connections {
+			my_addr,
+			next_port: 6000,
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
 				*(&mut data[0]) = MaybeUninit::new(pollfd(listener.as_raw_fd()));
@@ -142,7 +154,7 @@ impl<M> Connections<M> {
 		self.client_streams.insert(addr, stream);
 	}
 
-	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message>> {
+	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message<E>>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
@@ -151,7 +163,7 @@ impl<M> Connections<M> {
 
 		println!("nodes polled successfully: {}", pfds_to_read.len());
 
-		let mut msg_map: HashMap<NodeAddr, Vec<Message>> = HashMap::new();
+		let mut msg_map: HashMap<NodeAddr, Vec<Message<E>>> = HashMap::new();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
 			let addr = self
@@ -249,10 +261,57 @@ impl<M> Connections<M> {
 		msg_map
 	}
 
-	pub fn send_node_msg(&mut self, addr: &NodeAddr, msg: Message) {
-		match self.node_streams.get_mut(addr) {
-			// FIXME: convert msg to string
-			Some(stream) => match stream.write_all(b"blah") {
+	pub fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<Message<E>>) {
+		let mut to_send = vec![];
+		for msg in msgs {
+			let mut to_add = match msg {
+				Message::AppendReq(msg) => {
+					let mut v: Vec<u8> = b"aq".to_vec();
+					v.append(&mut msg.to_bytes());
+					v
+				}
+				Message::AppendRes(msg) => {
+					let mut v: Vec<u8> = b"as".to_vec();
+					v.append(&mut msg.to_bytes());
+					v
+				}
+				Message::VoteReq(msg) => {
+					let mut v: Vec<u8> = b"vq".to_vec();
+					v.append(&mut msg.to_bytes());
+					v
+				}
+				Message::VoteRes(msg) => {
+					let mut v: Vec<u8> = b"vs".to_vec();
+					v.append(&mut msg.to_bytes());
+					v
+				}
+			};
+			to_send.append(&mut to_add);
+		}
+
+		if self.node_streams.get_mut(addr).is_none() {
+			let build = TcpBuilder::new_v4().unwrap();
+			loop {
+				match build.bind(SocketAddr::new(self.my_addr, self.next_port)) {
+					Ok(b) => {
+						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, LISTEN_PORT)) {
+							stream
+								.set_nonblocking(true)
+								.expect("unable to set nonblocking");
+							self.register_node(addr.clone(), stream);
+						} else {
+							println!("couldn't connect, aborting");
+							return;
+						}
+						break;
+					}
+					Err(_) => self.next_port += 1,
+				}
+			}
+		}
+
+		if let Some(stream) = self.node_streams.get_mut(addr) {
+			match stream.write_all(&to_send) {
 				Ok(_) => {
 					println!("wrote message to node: {:?}", addr.addr);
 				}
@@ -262,8 +321,7 @@ impl<M> Connections<M> {
 					self.node_streams.remove_entry(addr);
 					self.updates.node_updated = true;
 				}
-			},
-			None => panic!("unable to find key for node_streams"),
+			}
 		}
 	}
 

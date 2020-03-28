@@ -3,11 +3,11 @@
  * by the nodes for state management.
  */
 use crate::connections::{ClientAddr, NodeAddr};
-use rafted::Message;
+use crate::serialize::{SerialStatus, Serialize};
+use rafted::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse};
 
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::marker::PhantomData;
 use std::str::{self, FromStr};
 
 pub enum ParseStatus {
@@ -27,29 +27,19 @@ where
 	fn parse(&mut self, key: &ClientAddr, stream: &mut S) -> (Vec<M>, ParseStatus);
 }
 
-pub struct ClientParser<S, M>
-where
-	S: Read,
-{
+pub struct ClientParser {
 	buffers: HashMap<ClientAddr, Vec<u8>>,
-	_stream: PhantomData<S>,
-	_message: PhantomData<M>,
 }
 
-impl<S, M> ClientParser<S, M>
-where
-	S: Read,
-{
-	pub fn new() -> ClientParser<S, M> {
+impl ClientParser {
+	pub fn new() -> ClientParser {
 		ClientParser {
 			buffers: HashMap::new(),
-			_stream: PhantomData,
-			_message: PhantomData,
 		}
 	}
 }
 
-impl<S, M> ClientParse<S, M> for ClientParser<S, M>
+impl<S, M> ClientParse<S, M> for ClientParser
 where
 	S: Read,
 	M: FromStr,
@@ -110,36 +100,144 @@ where
 ////////////////////// NODE PARSING CODE //////////////////////
 ///////////////////////////////////////////////////////////////
 
-pub trait NodeParse<S>
+pub trait NodeParse<S, E>
 where
 	S: Read,
+	E: Serialize,
 {
-	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message>, ParseStatus);
+	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message<E>>, ParseStatus);
 }
 
-pub struct NodeParser<S: Read> {
+pub struct NodeParser {
 	buffers: HashMap<NodeAddr, Vec<u8>>,
-	_marker: PhantomData<S>,
 }
 
-impl<S> NodeParser<S>
-where
-	S: Read,
-{
-	pub fn new() -> NodeParser<S> {
+impl NodeParser {
+	pub fn new() -> NodeParser {
 		NodeParser {
 			buffers: HashMap::new(),
-			_marker: PhantomData,
 		}
 	}
 }
 
-// FIXME - Actually add in parsing logic
-impl<S> NodeParse<S> for NodeParser<S>
+impl<S, E> NodeParse<S, E> for NodeParser
 where
 	S: Read,
+	E: Serialize,
 {
-	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message>, ParseStatus) {
-		unimplemented!();
+	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message<E>>, ParseStatus) {
+		let mut buf = vec![];
+		let status = match stream.read_to_end(&mut buf) {
+			Ok(_) => ParseStatus::Done,
+			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ParseStatus::Waiting,
+			Err(e) => panic!("some io error: {}", e),
+		};
+
+		let newbuf = match self.buffers.remove(key) {
+			Some(mut b) => {
+				b.append(&mut buf);
+				b
+			}
+			None => buf,
+		};
+		println!("current buf len: {}", newbuf.len());
+
+		let mut msgs: Vec<Message<E>> = vec![];
+		let mut curr_ind = 0;
+		loop {
+			if newbuf.len() < 2 + curr_ind {
+				let mut buf_to_store: Vec<u8> = vec![0; newbuf.len() - curr_ind];
+				buf_to_store.clone_from_slice(&newbuf[curr_ind..]);
+				self.buffers.insert(key.clone(), buf_to_store);
+				return (msgs, status);
+			}
+			match str::from_utf8(&newbuf[curr_ind..curr_ind + 2]) {
+				Ok(s) if s == "aq" => match AppendEntries::<E>::from_bytes(&newbuf[curr_ind + 2..]) {
+					Ok(tup) => {
+						let num_read = tup.0;
+						let msg = tup.1;
+
+						msgs.push(Message::AppendReq(*msg));
+						curr_ind += 2 + num_read;
+					}
+					Err(SerialStatus::Incomplete) => {
+						let mut buf_to_store: Vec<u8> = vec![0; newbuf.len() - curr_ind];
+						buf_to_store.clone_from_slice(&newbuf[curr_ind..]);
+						self.buffers.insert(key.clone(), buf_to_store);
+						return (msgs, status);
+					}
+					Err(SerialStatus::Error) => {
+						return (
+							msgs,
+							ParseStatus::Unexpected("serialize failed".to_string()),
+						);
+					}
+				},
+				Ok(s) if s == "as" => match AppendEntriesResponse::from_bytes(&newbuf[curr_ind + 2..]) {
+					Ok(tup) => {
+						let num_read = tup.0;
+						let msg = tup.1;
+
+						msgs.push(Message::AppendRes(*msg));
+						curr_ind += 2 + num_read;
+					}
+					Err(SerialStatus::Incomplete) => {
+						let mut buf_to_store: Vec<u8> = vec![0; newbuf.len() - curr_ind];
+						buf_to_store.clone_from_slice(&newbuf[curr_ind..]);
+						self.buffers.insert(key.clone(), buf_to_store);
+						return (msgs, status);
+					}
+					Err(SerialStatus::Error) => {
+						return (
+							msgs,
+							ParseStatus::Unexpected("serialize failed".to_string()),
+						);
+					}
+				},
+				Ok(s) if s == "vq" => match RequestVote::from_bytes(&newbuf[curr_ind + 2..]) {
+					Ok(tup) => {
+						let num_read = tup.0;
+						let msg = tup.1;
+
+						msgs.push(Message::VoteReq(*msg));
+						curr_ind += 2 + num_read;
+					}
+					Err(SerialStatus::Incomplete) => {
+						let mut buf_to_store: Vec<u8> = vec![0; newbuf.len() - curr_ind];
+						buf_to_store.clone_from_slice(&newbuf[curr_ind..]);
+						self.buffers.insert(key.clone(), buf_to_store);
+						return (msgs, status);
+					}
+					Err(SerialStatus::Error) => {
+						return (
+							msgs,
+							ParseStatus::Unexpected("serialize failed".to_string()),
+						);
+					}
+				},
+				Ok(s) if s == "vs" => match RequestVoteResponse::from_bytes(&newbuf[curr_ind + 2..]) {
+					Ok(tup) => {
+						let num_read = tup.0;
+						let msg = tup.1;
+
+						msgs.push(Message::VoteRes(*msg));
+						curr_ind += 2 + num_read;
+					}
+					Err(SerialStatus::Incomplete) => {
+						let mut buf_to_store: Vec<u8> = vec![0; newbuf.len() - curr_ind];
+						buf_to_store.clone_from_slice(&newbuf[curr_ind..]);
+						self.buffers.insert(key.clone(), buf_to_store);
+						return (msgs, status);
+					}
+					Err(SerialStatus::Error) => {
+						return (
+							msgs,
+							ParseStatus::Unexpected("serialize failed".to_string()),
+						);
+					}
+				},
+				_ => return (msgs, ParseStatus::Unexpected("msg incorrect".to_string())),
+			}
+		}
 	}
 }

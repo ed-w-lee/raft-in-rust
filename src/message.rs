@@ -1,33 +1,38 @@
 use crate::types::{LogIndex, NodeId, Term};
 
-pub struct AppendEntries {
-	term: Term,
-	leader_id: NodeId,
-	leader_commit: LogIndex,
-	prev_log_index: LogIndex,
-	prev_log_term: Term,
-	entries: Vec<u8>, // have the user translate string into list of entries?
+#[derive(Debug, PartialEq)]
+pub struct AppendEntries<E> {
+	pub term: Term,
+	pub leader_id: NodeId,
+	pub leader_commit: LogIndex,
+	pub prev_log_index: LogIndex,
+	pub prev_log_term: Term,
+	pub entries: Vec<E>,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct AppendEntriesResponse {
-	term: Term,
-	success: bool,
+	pub term: Term,
+	pub success: bool,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct RequestVote {
-	term: Term,
-	candidate_id: NodeId,
-	last_log_index: LogIndex,
-	last_log_term: Term,
+	pub term: Term,
+	pub candidate_id: NodeId,
+	pub last_log_index: LogIndex,
+	pub last_log_term: Term,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct RequestVoteResponse {
-	term: Term,
-	vote_granted: bool,
+	pub term: Term,
+	pub vote_granted: bool,
 }
 
-pub enum Message {
-	AppendReq(AppendEntries),
+#[derive(Debug, PartialEq)]
+pub enum Message<E> {
+	AppendReq(AppendEntries<E>),
 	AppendRes(AppendEntriesResponse),
 	VoteReq(RequestVote),
 	VoteRes(RequestVoteResponse),

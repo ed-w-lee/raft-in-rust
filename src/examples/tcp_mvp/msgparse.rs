@@ -2,7 +2,7 @@
  * Manages the translation from streams that implement Read to messages that can be used
  * by the nodes for state management.
  */
-use crate::connections::{ClientAddr, NodeAddr};
+use crate::connections::ClientAddr;
 use crate::serialize::{SerialStatus, Serialize};
 use rafted::message::{
 	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,

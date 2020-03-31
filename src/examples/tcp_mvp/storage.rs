@@ -32,8 +32,9 @@ where
 		}
 	}
 
-	pub fn get_hard_state(&mut self) -> Option<PersistentData<A, E>> {
+	pub fn get_data(&mut self) -> Option<PersistentData<A, E>> {
 		let mut buf = vec![];
+		self.go_to_start();
 		self
 			.file
 			.read_to_end(&mut buf)
@@ -87,11 +88,11 @@ where
 		})
 	}
 
-	pub fn store_hard_state(&mut self, hard_state: PersistentData<A, E>) -> Result<(), ()> {
+	pub fn store_data(&mut self, hard_state: &PersistentData<A, E>) -> std::io::Result<()> {
 		let mut buf = vec![];
 
 		buf.extend_from_slice(&hard_state.current_term.to_be_bytes());
-		match hard_state.voted_for {
+		match &hard_state.voted_for {
 			Some(addr) => {
 				buf.push(1u8);
 				buf.extend_from_slice(&addr.to_bytes());
@@ -100,19 +101,23 @@ where
 		}
 
 		buf.extend_from_slice(&(hard_state.log.len() as u64).to_be_bytes());
-		for tup in hard_state.log {
+		for tup in &hard_state.log {
 			let (term, entry) = tup;
 			buf.extend_from_slice(&term.to_be_bytes());
 			buf.extend_from_slice(&entry.to_bytes());
 		}
 
+		self.go_to_start();
+
+		self.file.write_all(&buf)?;
+		self.file.sync_data()?;
+		Ok(())
+	}
+
+	fn go_to_start(&mut self) {
 		self
 			.file
 			.seek(SeekFrom::Start(0))
 			.expect("couldn't seek to beginning");
-		match self.file.write_all(&buf) {
-			Ok(_) => Ok(()),
-			Err(_) => Err(()),
-		}
 	}
 }

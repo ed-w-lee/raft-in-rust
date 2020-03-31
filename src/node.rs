@@ -1,5 +1,6 @@
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{LogIndex, Term};
 
+#[derive(Debug)]
 pub struct PersistentData<A, E> {
 	pub current_term: Term,
 	pub voted_for: Option<A>,
@@ -81,5 +82,9 @@ where
 
 	pub fn is_other_node(&self, addr: &A) -> bool {
 		self.other_addrs.contains(addr)
+	}
+
+	pub fn get_hard_state(&self) -> &PersistentData<A, E> {
+		&self.hard_state
 	}
 }

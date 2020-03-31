@@ -130,16 +130,16 @@ impl Serialize for AppendEntriesResponse {
 	}
 }
 
-impl Serialize for RequestVote {
+impl<A> Serialize for RequestVote<A>
+where
+	A: Serialize,
+{
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut serial = vec![];
 
 		serial.extend_from_slice(&self.term.to_be_bytes());
 
-		let addr_str = self.candidate_id.to_string();
-		let addr_bytes = addr_str.as_bytes();
-		serial.extend_from_slice(&(addr_bytes.len() as u64).to_be_bytes());
-		serial.extend_from_slice(addr_bytes);
+		serial.extend_from_slice(&self.candidate_id.to_bytes());
 
 		serial.extend_from_slice(&self.last_log_index.to_be_bytes());
 		serial.extend_from_slice(&self.last_log_term.to_be_bytes());
@@ -166,12 +166,9 @@ impl Serialize for RequestVote {
 		let term = check(into_term(buf))?;
 		buf = shift(buf, size_of::<Term>());
 
-		let addr_len = check(into_u64(buf))? as usize;
-		buf = shift(buf, size_of::<u64>());
-		let addr_bytes = check(buf.get(0..addr_len))?;
-		let addr_str = check(str::from_utf8(addr_bytes).ok())?;
-		let candidate_id: IpAddr = check(addr_str.parse().ok())?;
-		buf = shift(buf, addr_len);
+		let tup = A::from_bytes(buf)?;
+		let (to_shift, candidate) = tup;
+		buf = shift(buf, to_shift);
 
 		let last_log_index = check(into_index(buf))?;
 		buf = shift(buf, size_of::<LogIndex>());
@@ -182,7 +179,7 @@ impl Serialize for RequestVote {
 			total_len,
 			Box::new(Self {
 				term,
-				candidate_id,
+				candidate_id: *candidate,
 				last_log_index,
 				last_log_term,
 			}),
@@ -423,14 +420,14 @@ mod tests {
 
 	#[test]
 	fn test_request_vote_convert() {
-		let ae: RequestVote = RequestVote {
+		let ae: RequestVote<IpAddr> = RequestVote {
 			candidate_id: "192.168.1.1".parse().unwrap(),
 			term: 10,
 			last_log_index: 20,
 			last_log_term: 500,
 		};
 		let bytes = ae.to_bytes();
-		match RequestVote::from_bytes(&bytes) {
+		match RequestVote::<IpAddr>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;
@@ -443,7 +440,7 @@ mod tests {
 
 	#[test]
 	fn test_request_vote_incomplete() {
-		let ae: RequestVote = RequestVote {
+		let ae: RequestVote<IpAddr> = RequestVote {
 			candidate_id: "192.168.1.1".parse().unwrap(),
 			term: 10,
 			last_log_index: 20,
@@ -452,13 +449,13 @@ mod tests {
 		let bytes = ae.to_bytes();
 		assert_eq!(
 			Err(SerialStatus::Incomplete),
-			RequestVote::from_bytes(&bytes[..bytes.len() - 10])
+			RequestVote::<IpAddr>::from_bytes(&bytes[..bytes.len() - 10])
 		);
 	}
 
 	#[test]
 	fn test_request_vote_error() {
-		let ae: RequestVote = RequestVote {
+		let ae: RequestVote<IpAddr> = RequestVote {
 			candidate_id: "192.168.1.1".parse().unwrap(),
 			term: 10,
 			last_log_index: 20,
@@ -469,13 +466,13 @@ mod tests {
 		bytes.append(&mut bytes.clone());
 		assert_eq!(
 			Err(SerialStatus::Error),
-			RequestVote::from_bytes(&bytes[..bytes.len()])
+			RequestVote::<IpAddr>::from_bytes(&bytes[..bytes.len()])
 		);
 	}
 
 	#[test]
 	fn test_request_vote_extend() {
-		let ae: RequestVote = RequestVote {
+		let ae: RequestVote<IpAddr> = RequestVote {
 			candidate_id: "192.168.1.1".parse().unwrap(),
 			term: 10,
 			last_log_index: 20,
@@ -484,7 +481,7 @@ mod tests {
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();
 		bytes.append(&mut vec![12, 34, 56, 78, 90]);
-		match RequestVote::from_bytes(&bytes) {
+		match RequestVote::<IpAddr>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;

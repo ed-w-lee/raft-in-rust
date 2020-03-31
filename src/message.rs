@@ -1,4 +1,4 @@
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{LogIndex, Term};
 
 #[derive(Debug, PartialEq)]
 pub struct AppendEntries<A, E> {
@@ -17,9 +17,9 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RequestVote {
+pub struct RequestVote<A> {
 	pub term: Term,
-	pub candidate_id: NodeId,
+	pub candidate_id: A,
 	pub last_log_index: LogIndex,
 	pub last_log_term: Term,
 }
@@ -34,6 +34,6 @@ pub struct RequestVoteResponse {
 pub enum Message<A, E> {
 	AppendReq(AppendEntries<A, E>),
 	AppendRes(AppendEntriesResponse),
-	VoteReq(RequestVote),
+	VoteReq(RequestVote<A>),
 	VoteRes(RequestVoteResponse),
 }

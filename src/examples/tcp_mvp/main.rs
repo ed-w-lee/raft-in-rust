@@ -48,8 +48,17 @@ fn main() {
 		.filter(|&addr| addr != my_addr)
 		.collect();
 
-	let mut hard_state = Storage::new(my_addr);
-	let node: Node<IpAddr, u64> = Node::new(my_addr, other_ips, hard_state.get_hard_state());
+	let mut storage = Storage::new(my_addr);
+	let node: Node<IpAddr, u64> = Node::new(my_addr, other_ips, storage.get_data());
+
+	println!("attempting to store: {:?}", node.get_hard_state());
+	loop {
+		match storage.store_data(node.get_hard_state()) {
+			Ok(_) => break,
+			Err(_) => (),
+		}
+	}
+	println!("stored owo: {:?}", storage.get_data());
 
 	listener
 		.set_nonblocking(true)

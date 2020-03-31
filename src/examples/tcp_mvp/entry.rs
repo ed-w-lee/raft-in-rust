@@ -10,7 +10,7 @@ impl Serialize for Entry {
 		unimplemented!()
 	}
 
-	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
+	fn from_bytes(_buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
 		unimplemented!()
 	}
 }

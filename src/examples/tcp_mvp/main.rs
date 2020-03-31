@@ -2,11 +2,16 @@ mod connections;
 mod entry;
 mod msgparse;
 mod serialize;
+mod storage;
 use connections::{ClientAddr, Connections, NodeAddr};
 // use entry::Entry;
 use msgparse::{ClientParser, NodeParser};
+use storage::Storage;
 
-use rafted::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse};
+use rafted::message::{
+	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+};
+use rafted::Node;
 
 // use libc;
 use std::cmp::min;
@@ -43,6 +48,9 @@ fn main() {
 		.filter(|&addr| addr != my_addr)
 		.collect();
 
+	let mut hard_state = Storage::new(my_addr);
+	let node: Node<IpAddr, u64> = Node::new(my_addr, other_ips, hard_state.get_hard_state());
+
 	listener
 		.set_nonblocking(true)
 		.expect("Cannot set non-blocking");
@@ -51,7 +59,7 @@ fn main() {
 		.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
 		.unwrap();
 
-	let n_parser: NodeParser = NodeParser::new();
+	let n_parser: NodeParser<IpAddr> = NodeParser::new();
 	let c_parser: ClientParser = ClientParser::new();
 	let mut conn_manager: Connections<u64, u64> =
 		Connections::new(my_addr, &listener, Box::new(n_parser), Box::new(c_parser));
@@ -75,7 +83,7 @@ fn main() {
 								.set_nonblocking(true)
 								.expect("stream.set_nonblocking failed");
 							let ip = addr.ip();
-							if other_ips.contains(&ip) {
+							if node.is_other_node(&ip) {
 								conn_manager.register_node(NodeAddr::new(ip), stream);
 							} else {
 								conn_manager.register_client(ClientAddr::new(addr), stream);
@@ -116,15 +124,15 @@ fn main() {
 			}
 			None => {
 				// election timeout
-				conn_manager.send_node(
-					&NodeAddr::new(other_ips[0]),
-					vec![Message::VoteReq(RequestVote {
-						term: 10,
-						candidate_id: my_addr,
-						last_log_index: 20,
-						last_log_term: 30,
-					})],
-				);
+				// conn_manager.send_node(
+				// 	&NodeAddr::new(other_ips[0]),
+				// 	vec![Message::VoteReq(RequestVote {
+				// 		term: 10,
+				// 		candidate_id: my_addr,
+				// 		last_log_index: 20,
+				// 		last_log_term: 30,
+				// 	})],
+				// );
 				deadline = Instant::now()
 					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
 					.unwrap();

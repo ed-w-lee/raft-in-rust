@@ -1,9 +1,9 @@
 use crate::types::{LogIndex, NodeId, Term};
 
 #[derive(Debug, PartialEq)]
-pub struct AppendEntries<E> {
+pub struct AppendEntries<A, E> {
 	pub term: Term,
-	pub leader_id: NodeId,
+	pub leader_id: A,
 	pub leader_commit: LogIndex,
 	pub prev_log_index: LogIndex,
 	pub prev_log_term: Term,
@@ -31,8 +31,8 @@ pub struct RequestVoteResponse {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Message<E> {
-	AppendReq(AppendEntries<E>),
+pub enum Message<A, E> {
+	AppendReq(AppendEntries<A, E>),
 	AppendRes(AppendEntriesResponse),
 	VoteReq(RequestVote),
 	VoteRes(RequestVoteResponse),

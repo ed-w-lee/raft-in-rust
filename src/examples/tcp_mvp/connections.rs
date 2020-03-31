@@ -3,7 +3,7 @@ use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
 use crate::serialize::Serialize;
 use crate::LISTEN_PORT;
 
-use rafted::Message;
+use rafted::message::Message;
 
 use libc::{self, POLLIN};
 use net2::TcpBuilder;
@@ -21,8 +21,8 @@ pub struct NodeAddr {
 	addr: IpAddr,
 }
 impl NodeAddr {
-	pub fn new(addr: IpAddr) -> NodeAddr {
-		NodeAddr { addr }
+	pub fn new(addr: IpAddr) -> Self {
+		Self { addr }
 	}
 }
 
@@ -58,7 +58,7 @@ pub struct Connections<M, E> {
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
-	node_parse: Box<dyn NodeParse<TcpStream, E>>,
+	node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
 	node_fds: HashMap<RawFd, NodeAddr>,
 	node_streams: HashMap<NodeAddr, TcpStream>,
 	client_parse: Box<dyn ClientParse<TcpStream, M>>,
@@ -75,9 +75,9 @@ where
 	pub fn new(
 		my_addr: IpAddr,
 		listener: &TcpListener,
-		node_parse: Box<dyn NodeParse<TcpStream, E>>,
+		node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
 		client_parse: Box<dyn ClientParse<TcpStream, M>>,
-	) -> Connections<M, E> {
+	) -> Self {
 		Connections {
 			my_addr,
 			next_port: 6000,
@@ -154,7 +154,7 @@ where
 		self.client_streams.insert(addr, stream);
 	}
 
-	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message<E>>> {
+	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message<IpAddr, E>>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
@@ -163,7 +163,7 @@ where
 
 		println!("nodes polled successfully: {}", pfds_to_read.len());
 
-		let mut msg_map: HashMap<NodeAddr, Vec<Message<E>>> = HashMap::new();
+		let mut msg_map: HashMap<NodeAddr, Vec<Message<IpAddr, E>>> = HashMap::new();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
 			let addr = self
@@ -175,7 +175,7 @@ where
 				.get_mut(addr)
 				.expect("unexpected key for node_streams");
 
-			let tup = self.node_parse.parse(addr, stream);
+			let tup = self.node_parse.parse(&addr.addr, stream);
 			let msgs = tup.0;
 			msg_map.insert(addr.clone(), msgs);
 
@@ -261,7 +261,7 @@ where
 		msg_map
 	}
 
-	pub fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<Message<E>>) {
+	pub fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<Message<IpAddr, E>>) {
 		let mut to_send = vec![];
 		for msg in msgs {
 			let mut to_add = match msg {

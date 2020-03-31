@@ -4,9 +4,12 @@
  */
 use crate::connections::{ClientAddr, NodeAddr};
 use crate::serialize::{SerialStatus, Serialize};
-use rafted::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse};
+use rafted::message::{
+	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+};
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{self, Read};
 use std::str::{self, FromStr};
 
@@ -100,32 +103,37 @@ where
 ////////////////////// NODE PARSING CODE //////////////////////
 ///////////////////////////////////////////////////////////////
 
-pub trait NodeParse<S, E>
+pub trait NodeParse<S, A, E>
 where
 	S: Read,
+	A: Serialize,
 	E: Serialize,
 {
-	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message<E>>, ParseStatus);
+	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<Message<A, E>>, ParseStatus);
 }
 
-pub struct NodeParser {
-	buffers: HashMap<NodeAddr, Vec<u8>>,
+pub struct NodeParser<A> {
+	buffers: HashMap<A, Vec<u8>>,
 }
 
-impl NodeParser {
-	pub fn new() -> NodeParser {
-		NodeParser {
+impl<A> NodeParser<A>
+where
+	A: Hash + Eq,
+{
+	pub fn new() -> Self {
+		Self {
 			buffers: HashMap::new(),
 		}
 	}
 }
 
-impl<S, E> NodeParse<S, E> for NodeParser
+impl<S, A, E> NodeParse<S, A, E> for NodeParser<A>
 where
 	S: Read,
+	A: Hash + Eq + Clone + Serialize,
 	E: Serialize,
 {
-	fn parse(&mut self, key: &NodeAddr, stream: &mut S) -> (Vec<Message<E>>, ParseStatus) {
+	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<Message<A, E>>, ParseStatus) {
 		let mut buf = vec![];
 		let status = match stream.read_to_end(&mut buf) {
 			Ok(_) => ParseStatus::Done,
@@ -142,7 +150,7 @@ where
 		};
 		println!("current buf len: {}", newbuf.len());
 
-		let mut msgs: Vec<Message<E>> = vec![];
+		let mut msgs: Vec<Message<A, E>> = vec![];
 		let mut curr_ind = 0;
 		loop {
 			if newbuf.len() < 2 + curr_ind {
@@ -152,7 +160,7 @@ where
 				return (msgs, status);
 			}
 			match str::from_utf8(&newbuf[curr_ind..curr_ind + 2]) {
-				Ok(s) if s == "aq" => match AppendEntries::<E>::from_bytes(&newbuf[curr_ind + 2..]) {
+				Ok(s) if s == "aq" => match AppendEntries::<A, E>::from_bytes(&newbuf[curr_ind + 2..]) {
 					Ok(tup) => {
 						let num_read = tup.0;
 						let msg = tup.1;

@@ -1,6 +1,5 @@
-use rafted::{
-	AppendEntries, AppendEntriesResponse, LogIndex, RequestVote, RequestVoteResponse, Term,
-};
+use rafted::message::{AppendEntries, AppendEntriesResponse, RequestVote, RequestVoteResponse};
+use rafted::{LogIndex, Term};
 
 use std::convert::TryInto;
 use std::mem::size_of;
@@ -24,8 +23,9 @@ pub trait Serialize {
 	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus>;
 }
 
-impl<E> Serialize for AppendEntries<E>
+impl<A, E> Serialize for AppendEntries<A, E>
 where
+	A: Serialize,
 	E: Serialize,
 {
 	fn to_bytes(&self) -> Vec<u8> {
@@ -33,10 +33,7 @@ where
 
 		serial.extend_from_slice(&self.term.to_be_bytes());
 
-		let addr_str = self.leader_id.to_string();
-		let addr_bytes = addr_str.as_bytes();
-		serial.extend_from_slice(&(addr_bytes.len() as u64).to_be_bytes());
-		serial.extend_from_slice(addr_bytes);
+		serial.extend_from_slice(&self.leader_id.to_bytes());
 
 		serial.extend_from_slice(&self.leader_commit.to_be_bytes());
 		serial.extend_from_slice(&self.prev_log_index.to_be_bytes());
@@ -71,12 +68,9 @@ where
 		let term = check(into_term(buf))?;
 		buf = shift(buf, size_of::<Term>());
 
-		let addr_len = check(into_u64(buf))? as usize;
-		buf = shift(buf, size_of::<u64>());
-		let addr_bytes = check(buf.get(0..addr_len))?;
-		let addr_str = check(str::from_utf8(addr_bytes).ok())?;
-		let leader_id: IpAddr = addr_str.parse().unwrap();
-		buf = shift(buf, addr_len);
+		let tup = A::from_bytes(buf)?;
+		let (to_shift, leader_id) = tup;
+		buf = shift(buf, to_shift);
 
 		let leader_commit = check(into_index(buf))?;
 		buf = shift(buf, size_of::<LogIndex>());
@@ -101,7 +95,7 @@ where
 			total_len,
 			Box::new(Self {
 				term,
-				leader_id,
+				leader_id: *leader_id,
 				leader_commit,
 				prev_log_index,
 				prev_log_term,
@@ -116,7 +110,7 @@ impl Serialize for AppendEntriesResponse {
 		let mut serial = vec![];
 
 		serial.extend_from_slice(&self.term.to_be_bytes());
-		serial.push(u8::from(if self.success { 1u8 } else { 0u8 }));
+		serial.push(if self.success { 1u8 } else { 0u8 });
 
 		serial
 	}
@@ -201,7 +195,7 @@ impl Serialize for RequestVoteResponse {
 		let mut serial = vec![];
 
 		serial.extend_from_slice(&self.term.to_be_bytes());
-		serial.push(u8::from(if self.vote_granted { 1u8 } else { 0u8 }));
+		serial.push(if self.vote_granted { 1u8 } else { 0u8 });
 
 		serial
 	}
@@ -233,6 +227,30 @@ impl Serialize for u64 {
 	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
 		let res = check(into_u64(buf))?;
 		Ok((size_of::<Self>(), Box::new(res)))
+	}
+}
+
+impl Serialize for IpAddr {
+	fn to_bytes(&self) -> Vec<u8> {
+		let mut buf = vec![];
+
+		let addr_str = self.to_string();
+		let addr_bytes = addr_str.as_bytes();
+		buf.extend_from_slice(&(addr_bytes.len() as u64).to_be_bytes());
+		buf.extend_from_slice(addr_bytes);
+
+		buf
+	}
+
+	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
+		let addr_len = check(into_u64(buf))? as usize;
+		let buf = shift(buf, size_of::<u64>());
+		let addr_bytes = check(buf.get(0..addr_len))?;
+		let addr_str = check(str::from_utf8(addr_bytes).ok())?;
+		Ok((
+			size_of::<u64>() + addr_len,
+			Box::new(check(addr_str.parse().ok())?),
+		))
 	}
 }
 
@@ -271,7 +289,7 @@ mod tests {
 
 	#[test]
 	fn test_append_entries_convert() {
-		let ae: AppendEntries<u64> = AppendEntries {
+		let ae: AppendEntries<IpAddr, u64> = AppendEntries {
 			term: 10,
 			leader_id: "127.0.0.1".parse().unwrap(),
 			leader_commit: 20,
@@ -281,7 +299,7 @@ mod tests {
 		};
 		let bytes = ae.to_bytes();
 		println!("{:?}", bytes);
-		match AppendEntries::<u64>::from_bytes(&bytes) {
+		match AppendEntries::<IpAddr, u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;
@@ -294,7 +312,7 @@ mod tests {
 
 	#[test]
 	fn test_append_entries_incomplete() {
-		let ae: AppendEntries<u64> = AppendEntries {
+		let ae: AppendEntries<IpAddr, u64> = AppendEntries {
 			term: 10,
 			leader_id: "127.0.0.1".parse().unwrap(),
 			leader_commit: 20,
@@ -305,13 +323,13 @@ mod tests {
 		let bytes = ae.to_bytes();
 		assert_eq!(
 			Err(SerialStatus::Incomplete),
-			AppendEntries::<u64>::from_bytes(&bytes[..bytes.len() - 10])
+			AppendEntries::<IpAddr, u64>::from_bytes(&bytes[..bytes.len() - 10])
 		);
 	}
 
 	#[test]
 	fn test_append_entries_error() {
-		let ae: AppendEntries<u64> = AppendEntries {
+		let ae: AppendEntries<IpAddr, u64> = AppendEntries {
 			term: 10,
 			leader_id: "127.0.0.1".parse().unwrap(),
 			leader_commit: 20,
@@ -324,13 +342,13 @@ mod tests {
 		bytes.append(&mut bytes.clone());
 		assert_eq!(
 			Err(SerialStatus::Error),
-			AppendEntries::<u64>::from_bytes(&bytes[..bytes.len()])
+			AppendEntries::<IpAddr, u64>::from_bytes(&bytes[..bytes.len()])
 		);
 	}
 
 	#[test]
 	fn test_append_entries_extend() {
-		let ae: AppendEntries<u64> = AppendEntries {
+		let ae: AppendEntries<IpAddr, u64> = AppendEntries {
 			term: 10,
 			leader_id: "127.0.0.1".parse().unwrap(),
 			leader_commit: 20,
@@ -341,7 +359,7 @@ mod tests {
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();
 		bytes.append(&mut vec![12, 34, 56, 78, 90]);
-		match AppendEntries::<u64>::from_bytes(&bytes) {
+		match AppendEntries::<IpAddr, u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;

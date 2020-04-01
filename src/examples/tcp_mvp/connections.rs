@@ -8,6 +8,7 @@ use rafted::message::Message;
 use libc::{self, POLLIN};
 use net2::TcpBuilder;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -70,7 +71,7 @@ pub struct Connections<M, E> {
 // TODO: maybe investigate lifetimes to keep track of RawFds?
 impl<M, E> Connections<M, E>
 where
-	E: Serialize,
+	E: Serialize + Debug,
 {
 	pub fn new(
 		my_addr: IpAddr,
@@ -161,8 +162,6 @@ where
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		println!("nodes polled successfully: {}", pfds_to_read.len());
-
 		let mut msg_map: HashMap<NodeAddr, Vec<Message<IpAddr, E>>> = HashMap::new();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
@@ -209,8 +208,6 @@ where
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
-
-		println!("clients polled successfully: {}", pfds_to_read.len());
 
 		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
 		let mut client_updated = false;
@@ -262,6 +259,8 @@ where
 	}
 
 	pub fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<Message<IpAddr, E>>) {
+		println!("sent to node {:?} message: {:?}", addr, msgs);
+
 		let mut to_send = vec![];
 		for msg in msgs {
 			let mut to_add = match msg {
@@ -312,11 +311,8 @@ where
 
 		if let Some(stream) = self.node_streams.get_mut(addr) {
 			match stream.write_all(&to_send) {
-				Ok(_) => {
-					println!("wrote message to node: {:?}", addr.addr);
-				}
+				Ok(_) => {}
 				Err(_) => {
-					println!("writing fucked up with node: {:?}", addr.addr);
 					self.node_fds.remove_entry(&stream.as_raw_fd());
 					self.node_streams.remove_entry(addr);
 					self.updates.node_updated = true;
@@ -329,15 +325,10 @@ where
 		match self.client_streams.get_mut(addr) {
 			Some(stream) => {
 				match stream.write_all(msg.as_bytes()) {
-					Ok(_) => {
-						println!("wrote msg to stream");
-					}
-					Err(_) => {
-						println!("writing fucked up woops");
-					}
+					Ok(_) => {}
+					Err(_) => {}
 				};
 				if !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
-					println!("tear down connection");
 					self.client_fds.remove_entry(&stream.as_raw_fd());
 					self.client_streams.remove_entry(addr);
 
@@ -350,9 +341,7 @@ where
 
 	pub fn regenerate_pollfds(&mut self) {
 		match (self.updates.client_updated, self.updates.node_updated) {
-			(false, false) => {
-				println!("no regeneration");
-			}
+			(false, false) => {}
 			(true, false) => {
 				// only client -> regenerate client, don't touch node
 				for i in self.node_end..self.curr_len {

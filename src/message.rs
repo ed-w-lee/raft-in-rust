@@ -37,3 +37,14 @@ pub enum Message<A, E> {
 	VoteReq(RequestVote<A>),
 	VoteRes(RequestVoteResponse),
 }
+
+impl<A, E> Message<A, E> {
+	pub fn get_term(&self) -> Term {
+		match self {
+			Message::AppendReq(a_req) => a_req.term,
+			Message::AppendRes(a_res) => a_res.term,
+			Message::VoteReq(v_req) => v_req.term,
+			Message::VoteRes(v_res) => v_res.term,
+		}
+	}
+}

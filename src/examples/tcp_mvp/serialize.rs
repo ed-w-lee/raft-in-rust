@@ -251,6 +251,36 @@ impl Serialize for IpAddr {
 	}
 }
 
+impl<T> Serialize for Option<T>
+where
+	T: Serialize,
+{
+	fn to_bytes(&self) -> Vec<u8> {
+		let mut buf = vec![];
+		match self {
+			Some(obj) => {
+				buf.push(1u8);
+				buf.extend_from_slice(&obj.to_bytes());
+			}
+			None => buf.push(0u8),
+		}
+		buf
+	}
+
+	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
+		let is_some = buf[0] > 0;
+		if is_some {
+			let slice = &buf[1..];
+			let tup = T::from_bytes(slice)?;
+			let (n_read, ret) = tup;
+
+			Ok((n_read + 1, Box::new(Some(*ret))))
+		} else {
+			Ok((1, Box::new(None)))
+		}
+	}
+}
+
 fn into_term(buf: &[u8]) -> Option<Term> {
 	let bytes = buf.get(0..size_of::<Term>())?;
 	let arr = bytes.try_into().ok()?;

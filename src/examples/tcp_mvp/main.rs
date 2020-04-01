@@ -6,31 +6,24 @@ mod storage;
 use connections::{ClientAddr, Connections, NodeAddr};
 // use entry::Entry;
 use msgparse::{ClientParser, NodeParser};
-use storage::Storage;
+use storage::FileStorage;
 
-use rafted::message::{
-	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
-};
-use rafted::Node;
+use rafted::{Node, Storage};
 
-// use libc;
-use std::cmp::min;
 use std::io;
-// use std::io::prelude::*;
 use std::io::Error;
 use std::net::{IpAddr, SocketAddr, TcpListener};
-// use std::os::unix::io::{AsRawFd, RawFd};
-// use std::thread;
 use std::time::{Duration, Instant};
 
-const ELECTION_TIMEOUT: u64 = 5000;
+const ELECTION_TIMEOUT: Duration = Duration::from_millis(5000);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2000);
 pub const LISTEN_PORT: u16 = 4242;
 
 fn main() {
 	let ips: Vec<IpAddr> = vec![
 		"127.0.0.11".parse().unwrap(),
 		"127.0.0.21".parse().unwrap(),
-		// "127.0.0.31".parse().unwrap(),
+		"127.0.0.31".parse().unwrap(),
 		// "127.0.0.41".parse().unwrap(),
 		// "127.0.0.51".parse().unwrap(),
 	];
@@ -48,25 +41,19 @@ fn main() {
 		.filter(|&addr| addr != my_addr)
 		.collect();
 
-	let mut storage = Storage::new(my_addr);
-	let node: Node<IpAddr, u64> = Node::new(my_addr, other_ips, storage.get_data());
-
-	println!("attempting to store: {:?}", node.get_hard_state());
-	loop {
-		match storage.store_data(node.get_hard_state()) {
-			Ok(_) => break,
-			Err(_) => (),
-		}
-	}
-	println!("stored owo: {:?}", storage.get_data());
+	let storage: FileStorage<IpAddr, u64> = FileStorage::new(my_addr);
+	let mut node: Node<IpAddr, u64> = Node::new(
+		my_addr,
+		other_ips,
+		Instant::now(),
+		ELECTION_TIMEOUT,
+		HEARTBEAT_TIMEOUT,
+		storage.get_data(),
+	);
 
 	listener
 		.set_nonblocking(true)
 		.expect("Cannot set non-blocking");
-
-	let mut deadline = Instant::now()
-		.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
-		.unwrap();
 
 	let n_parser: NodeParser<IpAddr> = NodeParser::new();
 	let c_parser: ClientParser = ClientParser::new();
@@ -74,14 +61,24 @@ fn main() {
 		Connections::new(my_addr, &listener, Box::new(n_parser), Box::new(c_parser));
 
 	loop {
-		match deadline.checked_duration_since(Instant::now()) {
+		match node
+			.get_next_deadline()
+			.checked_duration_since(Instant::now())
+		{
 			Some(timeout) => {
 				println!("time til election timeout: {:?}", timeout);
-				let result = conn_manager.poll(min(ELECTION_TIMEOUT as i32, timeout.as_millis() as i32));
+				let result = conn_manager.poll(timeout.as_millis() as i32 + 1);
 				println!("result: {}", result);
 				if result < 0 {
 					panic!("poll error: {}", Error::last_os_error());
-				} else if result > 0 {
+				} else if result == 0 {
+					// timed out
+					let to_send = node.tick(Instant::now());
+					for tup in to_send {
+						let (addr, msg) = tup;
+						conn_manager.send_node(&NodeAddr::new(addr), vec![msg]);
+					}
+				} else {
 					// TODO: we can probably use result to reduce the amount of time spent looking for
 					// readable sockets, but probably too little to matter
 
@@ -106,18 +103,14 @@ fn main() {
 
 					// handle messages from nodes first
 					let node_msgs = conn_manager.get_node_msgs();
-					node_msgs.iter().for_each(|(k, v)| {
-						println!("client: {:?}, msgs: {:?}", k, v);
-						let mut to_send = vec![];
+
+					node_msgs.iter().for_each(|(_k, v)| {
 						for msg in v {
-							if let Message::VoteReq(_) = msg {
-								to_send.push(Message::VoteRes(RequestVoteResponse {
-									term: 11,
-									vote_granted: false,
-								}));
+							for tup in node.receive(msg, Instant::now()) {
+								let (addr, msg_send) = tup;
+								conn_manager.send_node(&NodeAddr::new(addr), vec![msg_send]);
 							}
 						}
-						conn_manager.send_node(k, to_send);
 					});
 
 					// then handle messages from clients
@@ -129,23 +122,14 @@ fn main() {
 
 					conn_manager.regenerate_pollfds();
 				}
-				conn_manager.regenerate_pollfds();
 			}
 			None => {
-				// election timeout
-				// conn_manager.send_node(
-				// 	&NodeAddr::new(other_ips[0]),
-				// 	vec![Message::VoteReq(RequestVote {
-				// 		term: 10,
-				// 		candidate_id: my_addr,
-				// 		last_log_index: 20,
-				// 		last_log_term: 30,
-				// 	})],
-				// );
-				deadline = Instant::now()
-					.checked_add(Duration::from_millis(ELECTION_TIMEOUT))
-					.unwrap();
-				println!("election timeout");
+				println!("iteration went past deadline");
+				let to_send = node.tick(Instant::now());
+				for tup in to_send {
+					let (addr, msg) = tup;
+					conn_manager.send_node(&NodeAddr::new(addr), vec![msg]);
+				}
 			}
 		}
 	}

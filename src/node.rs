@@ -28,13 +28,14 @@ enum NodeType {
 	Follower,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone)]
 pub enum NodeRole {
 	Leader,
 	Candidate,
 	Follower,
 }
 
+#[derive(Copy, Clone)]
 pub struct NodeStatus<A> {
 	pub id: A,
 	pub role: NodeRole,

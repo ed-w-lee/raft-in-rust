@@ -11,6 +11,8 @@ libc = "0.2.68"
 
 [dev-dependencies]
 net2 = "0.2.33"
+rand_core = "0.5.1"
+rand_chacha = "0.2.2"
 
 [[example]]
 name = "tcp_mvp"

@@ -1,6 +1,6 @@
 use crate::types::{LogIndex, Term};
 
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::fmt::Debug;
 
 #[derive(Debug)]

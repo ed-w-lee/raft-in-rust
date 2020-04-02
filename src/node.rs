@@ -1,31 +1,44 @@
 use crate::message::{
 	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
 };
-use crate::persistent::{PersistentData, Storage};
+use crate::persistent::PersistentData;
 use crate::types::{LogIndex, Term};
 
 use std::cmp::min;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::time::{Duration, Instant};
 
-pub struct VolatileData {
+struct VolatileData {
 	commit_index: LogIndex,
 	last_applied: LogIndex,
 }
 
-pub struct LeaderData {
+struct LeaderData {
 	next_index: Vec<LogIndex>,
 	match_index: Vec<LogIndex>,
 }
 
-pub struct CandidateData {
+struct CandidateData {
 	votes: usize,
 }
 
-pub enum NodeType {
+enum NodeType {
 	Leader(LeaderData),
 	Candidate(CandidateData),
 	Follower,
+}
+
+#[derive(PartialEq)]
+pub enum NodeRole {
+	Leader,
+	Candidate,
+	Follower,
+}
+
+pub struct NodeStatus<A> {
+	pub id: A,
+	pub role: NodeRole,
+	pub term: Term,
 }
 
 pub struct Node<'a, A, E> {
@@ -41,6 +54,27 @@ pub struct Node<'a, A, E> {
 
 	hard_state: PersistentData<'a, A, E>,
 	soft_state: VolatileData,
+}
+
+impl<'a, A, E> Debug for Node<'a, A, E>
+where
+	A: Debug,
+	E: Debug,
+{
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Node")
+			.field("id", &self.my_id)
+			.field(
+				"type",
+				&(match self.curr_type {
+					NodeType::Leader(_) => "Leader",
+					NodeType::Candidate(_) => "Candidate",
+					NodeType::Follower => "Follower",
+				})
+				.to_string(),
+			)
+			.finish()
+	}
 }
 
 impl VolatileData {
@@ -103,7 +137,7 @@ where
 	}
 
 	fn _receive(&mut self, msg: &Message<A, E>, at: Instant) -> Vec<(A, Message<A, E>)> {
-		println!("received message: {:?}", msg);
+		println!("received at {:?} for {:?} -- message: {:?}", at, self, msg);
 
 		if msg.get_term() > self.hard_state.curr_term {
 			self.hard_state.curr_term = msg.get_term();
@@ -167,6 +201,7 @@ where
 	}
 
 	pub fn tick(&mut self, at: Instant) -> Vec<(A, Message<A, E>)> {
+		println!("ticking at {:?} -- {:?}", at, self);
 		match at.checked_duration_since(self.next_deadline) {
 			Some(_) => {
 				match self.curr_type {
@@ -212,6 +247,22 @@ where
 
 	pub fn get_next_deadline(&self) -> Instant {
 		self.next_deadline
+	}
+
+	pub fn get_id(&self) -> A {
+		self.my_id
+	}
+
+	pub fn get_status(&self) -> NodeStatus<A> {
+		NodeStatus {
+			id: self.my_id,
+			term: self.hard_state.curr_term,
+			role: match self.curr_type {
+				NodeType::Follower => NodeRole::Follower,
+				NodeType::Candidate(_) => NodeRole::Candidate,
+				NodeType::Leader(_) => NodeRole::Leader,
+			},
+		}
 	}
 
 	fn handle_append_entries(&mut self, req: &AppendEntries<A, E>) -> (A, Message<A, E>) {

@@ -5,7 +5,7 @@
 use crate::connections::ClientAddr;
 use crate::serialize::{SerialStatus, Serialize};
 use rafted::message::{
-	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+	AppendEntries, AppendEntriesResponse, NodeMessage, RequestVote, RequestVoteResponse,
 };
 
 use std::collections::HashMap;
@@ -109,7 +109,7 @@ where
 	A: Serialize,
 	E: Serialize,
 {
-	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<Message<A, E>>, ParseStatus);
+	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<NodeMessage<A, E>>, ParseStatus);
 }
 
 pub struct NodeParser<A> {
@@ -133,7 +133,7 @@ where
 	A: Hash + Eq + Clone + Serialize,
 	E: Serialize,
 {
-	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<Message<A, E>>, ParseStatus) {
+	fn parse(&mut self, key: &A, stream: &mut S) -> (Vec<NodeMessage<A, E>>, ParseStatus) {
 		let mut buf = vec![];
 		let status = match stream.read_to_end(&mut buf) {
 			Ok(_) => ParseStatus::Done,
@@ -150,7 +150,7 @@ where
 		};
 		println!("current buf len: {}", newbuf.len());
 
-		let mut msgs: Vec<Message<A, E>> = vec![];
+		let mut msgs: Vec<NodeMessage<A, E>> = vec![];
 		let mut curr_ind = 0;
 		loop {
 			if newbuf.len() < 2 + curr_ind {
@@ -165,7 +165,7 @@ where
 						let num_read = tup.0;
 						let msg = tup.1;
 
-						msgs.push(Message::AppendReq(*msg));
+						msgs.push(NodeMessage::AppendReq(*msg));
 						curr_ind += 2 + num_read;
 					}
 					Err(SerialStatus::Incomplete) => {
@@ -186,7 +186,7 @@ where
 						let num_read = tup.0;
 						let msg = tup.1;
 
-						msgs.push(Message::AppendRes(*msg));
+						msgs.push(NodeMessage::AppendRes(*msg));
 						curr_ind += 2 + num_read;
 					}
 					Err(SerialStatus::Incomplete) => {
@@ -207,7 +207,7 @@ where
 						let num_read = tup.0;
 						let msg = tup.1;
 
-						msgs.push(Message::VoteReq(*msg));
+						msgs.push(NodeMessage::VoteReq(*msg));
 						curr_ind += 2 + num_read;
 					}
 					Err(SerialStatus::Incomplete) => {
@@ -228,7 +228,7 @@ where
 						let num_read = tup.0;
 						let msg = tup.1;
 
-						msgs.push(Message::VoteRes(*msg));
+						msgs.push(NodeMessage::VoteRes(*msg));
 						curr_ind += 2 + num_read;
 					}
 					Err(SerialStatus::Incomplete) => {

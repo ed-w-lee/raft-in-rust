@@ -2,12 +2,14 @@ mod connections;
 mod entry;
 mod msgparse;
 mod serialize;
+mod statemachines;
 mod storage;
 use connections::{ClientAddr, Connections, NodeAddr};
-// use entry::Entry;
 use msgparse::{ClientParser, NodeParser};
+use statemachines::BasicStateMachine;
 use storage::FileStorage;
 
+use rafted::message::ClientRequest;
 use rafted::{Node, Storage};
 
 use std::io;
@@ -42,7 +44,7 @@ fn main() {
 		.collect();
 
 	let storage: FileStorage<IpAddr, u64> = FileStorage::new(my_addr);
-	let mut node: Node<IpAddr, u64> = Node::new(
+	let mut node: Node<IpAddr, u64, ClientAddr, (), u64, BasicStateMachine> = Node::new(
 		my_addr,
 		other_ips,
 		Instant::now(),
@@ -57,7 +59,7 @@ fn main() {
 
 	let n_parser: NodeParser<IpAddr> = NodeParser::new();
 	let c_parser: ClientParser = ClientParser::new();
-	let mut conn_manager: Connections<u64, u64> =
+	let mut conn_manager: Connections<u64, u64, u64> =
 		Connections::new(my_addr, &listener, Box::new(n_parser), Box::new(c_parser));
 
 	loop {
@@ -74,9 +76,8 @@ fn main() {
 				} else if result == 0 {
 					// timed out
 					let to_send = node.tick(Instant::now());
-					for tup in to_send {
-						let (addr, msg) = tup;
-						conn_manager.send_node(&NodeAddr::new(addr), vec![msg]);
+					for msg in to_send {
+						conn_manager.send_message(msg);
 					}
 				} else {
 					// TODO: we can probably use result to reduce the amount of time spent looking for
@@ -106,29 +107,29 @@ fn main() {
 
 					node_msgs.iter().for_each(|(_k, v)| {
 						for msg in v {
-							for tup in node.receive(msg, Instant::now()) {
-								let (addr, msg_send) = tup;
-								conn_manager.send_node(&NodeAddr::new(addr), vec![msg_send]);
+							for to_send in node.receive(msg, Instant::now()) {
+								conn_manager.send_message(to_send);
 							}
 						}
 					});
 
 					// then handle messages from clients
 					let client_msgs = conn_manager.get_client_msgs();
-					client_msgs.iter().for_each(|(k, v)| {
-						println!("client: {:?}, msgs: {:?}", k, v);
-						conn_manager.send_client(k, &format!("{:?}\n", v));
-					});
+					for (k, v) in client_msgs {
+						for val in v {
+							let client_req = ClientRequest::Apply(k, val);
+							node.receive_client(client_req, Instant::now());
+						}
+					}
 
 					conn_manager.regenerate_pollfds();
 				}
 			}
 			None => {
 				println!("iteration went past deadline");
-				let to_send = node.tick(Instant::now());
-				for tup in to_send {
-					let (addr, msg) = tup;
-					conn_manager.send_node(&NodeAddr::new(addr), vec![msg]);
+				let msgs = node.tick(Instant::now());
+				for to_send in msgs {
+					conn_manager.send_message(to_send);
 				}
 			}
 		}

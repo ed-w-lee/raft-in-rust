@@ -1,11 +1,15 @@
 use crate::message::{
-	AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+	AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Message, NodeMessage,
+	RequestVote, RequestVoteResponse,
 };
 use crate::persistent::PersistentData;
+use crate::statemachine::StateMachine;
 use crate::types::{LogIndex, Term};
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 struct VolatileData {
@@ -42,25 +46,38 @@ pub struct NodeStatus<A> {
 	pub term: Term,
 }
 
-pub struct Node<'a, A, E> {
+/// Represents a node in a Raft system.
+///
+/// Type parameters:
+/// NA - node address
+/// ENT - log entry
+/// CA - client address
+/// REQ - client request
+/// RES - client response
+/// SM - state machine
+pub struct Node<'a, NA, ENT, CA, REQ, RES, SM> {
 	curr_type: NodeType,
-	my_id: A,
-	other_addrs: Vec<A>,
+	my_id: NA,
+	other_addrs: Vec<NA>,
 
 	election_timeout: Duration,
 	heartbeat_timeout: Duration,
 	next_deadline: Instant,
 
-	last_known_leader: Option<A>,
+	last_known_leader: Option<NA>,
 
-	hard_state: PersistentData<'a, A, E>,
+	hard_state: PersistentData<'a, NA, ENT>,
 	soft_state: VolatileData,
+	statemachine: SM,
+
+	client_addrs: HashMap<LogIndex, CA>,
+	_client_req: PhantomData<REQ>,
+	_client_res: PhantomData<RES>,
 }
 
-impl<'a, A, E> Debug for Node<'a, A, E>
+impl<'a, NA, ENT, CA, REQ, RES, SM> Debug for Node<'a, NA, ENT, CA, REQ, RES, SM>
 where
-	A: Debug,
-	E: Debug,
+	NA: Debug,
 {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Node")
@@ -97,18 +114,20 @@ impl LeaderData {
 }
 
 // Assumes that {receive, propose, tick} will be called with an `at` that monotonically increases
-impl<'a, A, E> Node<'a, A, E>
+impl<'a, NA, ENT, CA, REQ, RES, SM> Node<'a, NA, ENT, CA, REQ, RES, SM>
 where
-	A: Eq + Copy + Clone + Debug,
-	E: Debug,
+	NA: Eq + Copy + Clone + Debug,
+	ENT: Debug,
+	CA: Clone,
+	SM: StateMachine<REQ, ENT, RES>,
 {
 	pub fn new(
-		my_id: A,
-		other_addrs: Vec<A>,
+		my_id: NA,
+		other_addrs: Vec<NA>,
 		created_on: Instant,
 		election_timeout: Duration,
 		heartbeat_timeout: Duration,
-		curr_state: PersistentData<'a, A, E>,
+		curr_state: PersistentData<'a, NA, ENT>,
 	) -> Self {
 		Self {
 			curr_type: NodeType::Follower,
@@ -123,21 +142,36 @@ where
 
 			hard_state: curr_state,
 			soft_state: VolatileData::new(),
+			statemachine: SM::new(),
+
+			client_addrs: HashMap::new(),
+			_client_req: PhantomData,
+			_client_res: PhantomData,
 		}
 	}
 
-	pub fn is_other_node(&self, addr: &A) -> bool {
+	pub fn is_other_node(&self, addr: &NA) -> bool {
 		self.other_addrs.contains(addr)
 	}
 
-	pub fn receive(&mut self, msg: &Message<A, E>, at: Instant) -> Vec<(A, Message<A, E>)> {
-		let to_ret = self._receive(msg, at);
+	pub fn receive(
+		&mut self,
+		msg: &NodeMessage<NA, ENT>,
+		at: Instant,
+	) -> Vec<Message<NA, ENT, CA, RES>> {
+		let mut updates = self._update_statemachine();
+		let mut to_ret = self._receive(msg, at);
 		// we just want to make sure the persistent data gets flushed before any messages get sent
 		self.hard_state.flush();
-		to_ret
+		updates.append(&mut to_ret);
+		updates
 	}
 
-	fn _receive(&mut self, msg: &Message<A, E>, at: Instant) -> Vec<(A, Message<A, E>)> {
+	fn _receive(
+		&mut self,
+		msg: &NodeMessage<NA, ENT>,
+		at: Instant,
+	) -> Vec<Message<NA, ENT, CA, RES>> {
 		println!("received at {:?} for {:?} -- message: {:?}", at, self, msg);
 
 		if msg.get_term() > self.hard_state.curr_term {
@@ -148,37 +182,37 @@ where
 
 		match &mut self.curr_type {
 			NodeType::Follower => match msg {
-				Message::AppendReq(req) => {
+				NodeMessage::AppendReq(req) => {
 					if req.term >= self.hard_state.curr_term {
 						// should be current leader
 						self.next_deadline = at + self.election_timeout;
 					}
-					vec![self.handle_append_entries(req)]
+					vec![self._handle_append_entries(req)]
 				}
-				Message::VoteReq(req) => vec![self.handle_request_vote(req)],
+				NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req)],
 				_ => vec![],
 			},
 			NodeType::Candidate(cand) => {
 				match msg {
-					Message::AppendReq(req) => {
+					NodeMessage::AppendReq(req) => {
 						self.curr_type = NodeType::Follower;
-						vec![self.handle_append_entries(req)]
+						vec![self._handle_append_entries(req)]
 					}
 					// we know this is going to reject, but whatever
-					Message::VoteReq(req) => vec![self.handle_request_vote(req)],
-					Message::VoteRes(res) => {
+					NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req)],
+					NodeMessage::VoteRes(res) => {
 						// TODO - we may want to use set of nodes to avoid replay
 						// (that's not in our current failure model afaik)
 						if res.vote_granted {
 							cand.votes += 1;
 
 							if cand.votes > (self.other_addrs.len() + 1) / 2 {
-								return self.to_leader(at);
+								return self._to_leader(at);
 							}
 						}
 						vec![]
 					}
-					Message::AppendRes(_) => vec![],
+					NodeMessage::AppendRes(_) => vec![],
 				}
 			}
 			NodeType::Leader(_) => match msg {
@@ -190,10 +224,40 @@ where
 		}
 	}
 
-	pub fn propose(&mut self, entry: E, at: Instant) -> Result<Vec<(A, Message<A, E>)>, Option<A>> {
+	pub fn receive_client(
+		&mut self,
+		req: ClientRequest<CA, REQ, ENT>,
+		at: Instant,
+	) -> Vec<Message<NA, ENT, CA, RES>> {
+		let mut updates = self._update_statemachine();
+
+		let mut to_ret = self._receive_client(req, at);
+
+		updates.append(&mut to_ret);
+		updates
+	}
+
+	fn _receive_client(
+		&mut self,
+		req: ClientRequest<CA, REQ, ENT>,
+		at: Instant,
+	) -> Vec<Message<NA, ENT, CA, RES>> {
 		match self.curr_type {
-			NodeType::Candidate(_) => Err(self.last_known_leader.clone()),
-			NodeType::Follower => Err(self.last_known_leader.clone()),
+			NodeType::Candidate(_) => match self.last_known_leader {
+				Some(node) => vec![Message::Client(
+					req.get_addr(),
+					ClientResponse::Redirect(node),
+				)],
+				None => vec![Message::Client(req.get_addr(), ClientResponse::TryAgain)],
+			},
+			NodeType::Follower => match self.last_known_leader {
+				Some(node) => vec![Message::Client(
+					req.get_addr(),
+					ClientResponse::Redirect(node),
+				)],
+				None => vec![Message::Client(req.get_addr(), ClientResponse::TryAgain)],
+			},
+
 			NodeType::Leader(_) => {
 				// send append entries, or store it to be sent on heartbeat timeout
 				unimplemented!()
@@ -201,18 +265,25 @@ where
 		}
 	}
 
-	pub fn tick(&mut self, at: Instant) -> Vec<(A, Message<A, E>)> {
+	pub fn tick(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
+		let mut updates = self._update_statemachine();
+		let mut to_ret = self._tick(at);
+		updates.append(&mut to_ret);
+		updates
+	}
+
+	fn _tick(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
 		println!("ticking at {:?} -- {:?}", at, self);
 		match at.checked_duration_since(self.next_deadline) {
 			Some(_) => {
 				match self.curr_type {
 					NodeType::Follower => {
 						// convert to candidate & start election
-						self.start_election(at)
+						self._start_election(at)
 					}
 					NodeType::Candidate(_) => {
 						// start new election
-						self.start_election(at)
+						self._start_election(at)
 					}
 					NodeType::Leader(_) => {
 						// send append entries to all nodes
@@ -223,9 +294,9 @@ where
 							.other_addrs
 							.iter()
 							.map(|addr| {
-								(
+								Message::Node(
 									addr.clone(),
-									Message::AppendReq(AppendEntries {
+									NodeMessage::AppendReq(AppendEntries {
 										term: self.hard_state.curr_term,
 										leader_id: self.my_id,
 										leader_commit: self.soft_state.commit_index,
@@ -250,11 +321,11 @@ where
 		self.next_deadline
 	}
 
-	pub fn get_id(&self) -> A {
+	pub fn get_id(&self) -> NA {
 		self.my_id
 	}
 
-	pub fn get_status(&self) -> NodeStatus<A> {
+	pub fn get_status(&self) -> NodeStatus<NA> {
 		NodeStatus {
 			id: self.my_id,
 			term: self.hard_state.curr_term,
@@ -266,15 +337,15 @@ where
 		}
 	}
 
-	fn handle_append_entries(&mut self, req: &AppendEntries<A, E>) -> (A, Message<A, E>) {
+	fn _handle_append_entries(&mut self, req: &AppendEntries<NA, ENT>) -> Message<NA, ENT, CA, RES> {
 		if req.term < self.hard_state.curr_term
 			|| !self
 				.hard_state
 				.has_entry_with(req.prev_log_index, req.prev_log_term)
 		{
-			(
+			Message::Node(
 				req.leader_id,
-				Message::AppendRes(AppendEntriesResponse {
+				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
 					success: false,
 				}),
@@ -287,9 +358,9 @@ where
 				self.soft_state.commit_index = min(req.leader_commit, self.hard_state.last_entry());
 			}
 
-			(
+			Message::Node(
 				req.leader_id,
-				Message::AppendRes(AppendEntriesResponse {
+				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
 					success: true,
 				}),
@@ -297,7 +368,7 @@ where
 		}
 	}
 
-	fn handle_request_vote(&mut self, req: &RequestVote<A>) -> (A, Message<A, E>) {
+	fn _handle_request_vote(&mut self, req: &RequestVote<NA>) -> Message<NA, ENT, CA, RES> {
 		let mut vote_granted = false;
 
 		if req.term >= self.hard_state.curr_term
@@ -311,16 +382,16 @@ where
 			vote_granted = true;
 		}
 
-		(
+		Message::Node(
 			req.candidate_id,
-			Message::VoteRes(RequestVoteResponse {
+			NodeMessage::VoteRes(RequestVoteResponse {
 				term: self.hard_state.curr_term,
 				vote_granted,
 			}),
 		)
 	}
 
-	fn to_leader(&mut self, at: Instant) -> Vec<(A, Message<A, E>)> {
+	fn _to_leader(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
 		self.next_deadline = at + self.heartbeat_timeout;
 
 		self.curr_type = NodeType::Leader(LeaderData::new(
@@ -333,9 +404,9 @@ where
 			.other_addrs
 			.iter()
 			.map(|addr| {
-				(
+				Message::Node(
 					addr.clone(),
-					Message::AppendReq(AppendEntries {
+					NodeMessage::AppendReq(AppendEntries {
 						term: self.hard_state.curr_term,
 						leader_id: self.my_id,
 						leader_commit: self.soft_state.commit_index,
@@ -348,7 +419,7 @@ where
 			.collect()
 	}
 
-	fn start_election(&mut self, at: Instant) -> Vec<(A, Message<A, E>)> {
+	fn _start_election(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
 		self.curr_type = NodeType::Candidate(CandidateData { votes: 1 });
 
 		self.hard_state.curr_term += 1;
@@ -359,9 +430,9 @@ where
 			.other_addrs
 			.iter()
 			.map(|addr| {
-				(
+				Message::Node(
 					addr.clone(),
-					Message::VoteReq(RequestVote {
+					NodeMessage::VoteReq(RequestVote {
 						term: self.hard_state.curr_term,
 						candidate_id: self.my_id,
 						last_log_index: 0,
@@ -370,5 +441,25 @@ where
 				)
 			})
 			.collect()
+	}
+
+	fn _update_statemachine(&mut self) -> Vec<Message<NA, ENT, CA, RES>> {
+		let mut to_ret = vec![];
+		while self.soft_state.commit_index > self.soft_state.last_applied {
+			self.soft_state.last_applied += 1;
+			let idx = self.soft_state.last_applied;
+			match self.curr_type {
+				NodeType::Leader(_) => {
+					if self.client_addrs.contains_key(&idx) {
+						to_ret.push(Message::Client(
+							self.client_addrs[&idx].clone(),
+							ClientResponse::Response(self.statemachine.apply(self.hard_state.get_entry(idx))),
+						));
+					}
+				}
+				_ => {}
+			}
+		}
+		to_ret
 	}
 }

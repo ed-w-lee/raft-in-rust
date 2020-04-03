@@ -81,6 +81,13 @@ impl<'a, A, E> PersistentData<'a, A, E> {
 	}
 
 	/* Log related stuff */
+	pub fn get_entry(&self, index: LogIndex) -> &E {
+		if index <= self.first_index {
+			panic!("bad index query");
+		} else {
+			&self.entries[(index - self.first_index - 1) as usize].1
+		}
+	}
 
 	pub fn append_entries(&mut self, new_entries: &mut Vec<(Term, E)>) {
 		if !new_entries.is_empty() {

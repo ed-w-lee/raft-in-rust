@@ -1,4 +1,5 @@
-use rafted::message::Message;
+use rafted::message::{Message, NodeMessage};
+use rafted::statemachine::StateMachine;
 use rafted::{LogIndex, Node, NodeStatus, PersistentData, Storage, Term};
 
 use std::cell::RefCell;
@@ -13,22 +14,22 @@ use rand_core::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 
 pub type NodeId = u64;
+pub type ClientAddr = u64;
 pub type Entry = u64;
-pub type ClientMessage = u64;
+pub type ClientRes = u64;
 
 const DEFAULT_SEED: [u8; 32] = [
 	20, 21, 22, 23, 1, 2, 3, 4, 0, 10, 20, 30, 69, 79, 89, 99, 14, 24, 34, 44, 88, 98, 108, 118, 45,
 	56, 67, 78, 90, 09, 98, 87,
 ];
 
-enum AnyMessage {
-	Client(NodeId, ClientMessage),
-	Node(NodeId, Message<NodeId, Entry>),
-}
-
+// our simulation is more for handling inter-node wonkiness
+// so we're only going to care about manipulating / dropping
+// inter-node messages at this point
 pub struct SimMessage {
 	at: Instant,
-	msg: AnyMessage,
+	dst: NodeId,
+	msg: NodeMessage<NodeId, Entry>,
 }
 
 pub enum Event {
@@ -155,6 +156,29 @@ impl<'a> Storage<'a, NodeId, Entry> for StorageHandle {
 	}
 }
 
+pub struct SimStateMachine {
+	my_num: u64,
+}
+
+impl StateMachine<(), u64, u64> for SimStateMachine {
+	fn new() -> Self {
+		Self { my_num: 1 }
+	}
+
+	fn read(&self, _req: &()) -> u64 {
+		self.my_num
+	}
+
+	fn apply(&mut self, ent: &u64) -> u64 {
+		if self.my_num > *ent {
+			0
+		} else {
+			self.my_num = *ent;
+			self.my_num
+		}
+	}
+}
+
 pub struct Simulation<'a> {
 	rng: ChaChaRng,
 	prob_drop_msg: u32,
@@ -165,7 +189,7 @@ pub struct Simulation<'a> {
 	msg_delay: Duration,
 
 	storage: SimulationStorage,
-	nodes: Vec<Option<Node<'a, NodeId, Entry>>>,
+	nodes: Vec<Option<Node<'a, NodeId, Entry, ClientAddr, (), ClientRes, SimStateMachine>>>,
 	messages: BinaryHeap<SimMessage>,
 	next_tick: Vec<Instant>,
 }
@@ -228,7 +252,7 @@ impl<'a> TryFrom<SimulationOpts> for Simulation<'a> {
 		// we're just gonna assume micros granularity
 		let e_range = (my_e.1 - my_e.0).as_micros() as u64;
 
-		let mut nodes: Vec<Option<Node<'a, NodeId, Entry>>> = vec![];
+		let mut nodes = vec![];
 		for i in node_ids {
 			let mut addrs: Vec<NodeId> = (0..opts.num_nodes).collect();
 			addrs.remove(i as usize);
@@ -271,6 +295,16 @@ impl<'a> Simulation<'a> {
 	pub fn set_drop_rate(&mut self, drop_rate: u32) {
 		assert!(drop_rate <= 100);
 		self.prob_drop_msg = drop_rate;
+	}
+
+	/// prevents any **new** messages from being sent from src to dst.
+	pub fn drop_conn(&mut self, src: NodeId, dst: NodeId) {
+		self.dropped_conns.insert((src, dst));
+	}
+
+	/// allows **new** messages to be sent from src to dst.
+	pub fn enable_conn(&mut self, src: NodeId, dst: NodeId) {
+		self.dropped_conns.remove(&(src, dst));
 	}
 
 	pub fn stop_node(&mut self, node_id: NodeId) {
@@ -340,15 +374,11 @@ impl<'a> Simulation<'a> {
 					}
 					Event::Message(packet) => {
 						let at = packet.at;
-						match packet.msg {
-							AnyMessage::Client(_, _) => unimplemented!(),
-							AnyMessage::Node(node_id, msg) => {
-								if let Some(node) = &mut self.nodes[node_id as usize] {
-									(node_id, node.receive(&msg, at), at)
-								} else {
-									(node_id, vec![], at)
-								}
-							}
+						let node_id = packet.dst;
+						if let Some(node) = &mut self.nodes[node_id as usize] {
+							(node_id, node.receive(&packet.msg, at), at)
+						} else {
+							(node_id, vec![], at)
 						}
 					}
 				}
@@ -365,13 +395,18 @@ impl<'a> Simulation<'a> {
 			};
 
 			// register all messages
-			for tup in msgs_to_send {
-				let (dest, msg) = tup;
-				if !self.dropped_conns.contains(&(src, dest)) {
-					self.messages.push(SimMessage {
-						at: at + self.msg_delay,
-						msg: AnyMessage::Node(dest, msg),
-					});
+			for to_send in msgs_to_send {
+				match to_send {
+					Message::Node(dst, msg) => {
+						if !self.dropped_conns.contains(&(src, dst)) {
+							self.messages.push(SimMessage {
+								at: at + self.msg_delay,
+								dst: dst,
+								msg: msg,
+							});
+						}
+					}
+					Message::Client(_, _) => unimplemented!(),
 				}
 			}
 

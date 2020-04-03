@@ -1,6 +1,7 @@
 pub mod message;
 mod node;
 mod persistent;
+pub mod statemachine;
 mod types;
 
 // pub use crate::message::*;

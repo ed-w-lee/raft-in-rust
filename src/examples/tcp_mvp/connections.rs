@@ -3,13 +3,14 @@ use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
 use crate::serialize::Serialize;
 use crate::LISTEN_PORT;
 
-use rafted::message::Message;
+use rafted::message::{ClientResponse, Message, NodeMessage};
 
 use libc::{self, POLLIN};
 use net2::TcpBuilder;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -53,7 +54,7 @@ pub struct ConnUpdates {
  * polling, only being able to poll once fds are regenerated, etc. I tried doing that
  * but it got too complicated imo.
  */
-pub struct Connections<M, E> {
+pub struct Connections<M, E, RES> {
 	my_addr: IpAddr,
 	next_port: u16,
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
@@ -66,12 +67,14 @@ pub struct Connections<M, E> {
 	client_fds: HashMap<RawFd, (bool, ClientAddr)>,
 	client_streams: HashMap<ClientAddr, TcpStream>,
 	updates: ConnUpdates,
+	_response: PhantomData<RES>,
 }
 
 // TODO: maybe investigate lifetimes to keep track of RawFds?
-impl<M, E> Connections<M, E>
+impl<M, E, RES> Connections<M, E, RES>
 where
 	E: Serialize + Debug,
+	RES: ToString,
 {
 	pub fn new(
 		my_addr: IpAddr,
@@ -99,6 +102,7 @@ where
 				node_updated: false,
 				client_updated: false,
 			},
+			_response: PhantomData,
 		}
 	}
 
@@ -155,14 +159,14 @@ where
 		self.client_streams.insert(addr, stream);
 	}
 
-	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<Message<IpAddr, E>>> {
+	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		let mut msg_map: HashMap<NodeAddr, Vec<Message<IpAddr, E>>> = HashMap::new();
+		let mut msg_map: HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = HashMap::new();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
 			let addr = self
@@ -258,28 +262,44 @@ where
 		msg_map
 	}
 
-	pub fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<Message<IpAddr, E>>) {
+	pub fn send_message(&mut self, mesg: Message<IpAddr, E, ClientAddr, RES>) {
+		match mesg {
+			Message::Node(addr, msg) => self.send_node(&NodeAddr { addr }, vec![msg]),
+			Message::Client(addr, res) => match res {
+				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string()),
+				ClientResponse::Redirect(a) => {
+					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()))
+				}
+				ClientResponse::TryAgain => self.send_client(
+					&addr,
+					"no known leader. try again another node another time",
+				),
+			},
+		}
+	}
+
+	fn send_node(&mut self, addr: &NodeAddr, msgs: Vec<NodeMessage<IpAddr, E>>) {
 		println!("sent to node {:?} message: {:?}", addr, msgs);
 
 		let mut to_send = vec![];
 		for msg in msgs {
 			let mut to_add = match msg {
-				Message::AppendReq(msg) => {
+				NodeMessage::AppendReq(msg) => {
 					let mut v: Vec<u8> = b"aq".to_vec();
 					v.append(&mut msg.to_bytes());
 					v
 				}
-				Message::AppendRes(msg) => {
+				NodeMessage::AppendRes(msg) => {
 					let mut v: Vec<u8> = b"as".to_vec();
 					v.append(&mut msg.to_bytes());
 					v
 				}
-				Message::VoteReq(msg) => {
+				NodeMessage::VoteReq(msg) => {
 					let mut v: Vec<u8> = b"vq".to_vec();
 					v.append(&mut msg.to_bytes());
 					v
 				}
-				Message::VoteRes(msg) => {
+				NodeMessage::VoteRes(msg) => {
 					let mut v: Vec<u8> = b"vs".to_vec();
 					v.append(&mut msg.to_bytes());
 					v
@@ -321,7 +341,7 @@ where
 		}
 	}
 
-	pub fn send_client(&mut self, addr: &ClientAddr, msg: &String) {
+	fn send_client(&mut self, addr: &ClientAddr, msg: &str) {
 		match self.client_streams.get_mut(addr) {
 			Some(stream) => {
 				match stream.write_all(msg.as_bytes()) {

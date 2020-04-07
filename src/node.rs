@@ -117,7 +117,7 @@ impl LeaderData {
 impl<'a, NA, ENT, CA, REQ, RES, SM> Node<'a, NA, ENT, CA, REQ, RES, SM>
 where
 	NA: Eq + Copy + Clone + Debug,
-	ENT: Debug,
+	ENT: Debug + Clone,
 	CA: Clone,
 	SM: StateMachine<REQ, ENT, RES>,
 {
@@ -216,10 +216,8 @@ where
 				}
 			}
 			NodeType::Leader(_) => match msg {
-				_ => {
-					// TODO - implement leader logic
-					vec![]
-				}
+				NodeMessage::AppendRes(res) => unimplemented!(),
+				_ => vec![],
 			},
 		}
 	}
@@ -232,6 +230,7 @@ where
 		let mut updates = self._update_statemachine();
 
 		let mut to_ret = self._receive_client(req, at);
+		self.hard_state.flush();
 
 		updates.append(&mut to_ret);
 		updates
@@ -242,7 +241,7 @@ where
 		req: ClientRequest<CA, REQ, ENT>,
 		at: Instant,
 	) -> Vec<Message<NA, ENT, CA, RES>> {
-		match self.curr_type {
+		match &self.curr_type {
 			NodeType::Candidate(_) => match self.last_known_leader {
 				Some(node) => vec![Message::Client(
 					req.get_addr(),
@@ -259,8 +258,19 @@ where
 			},
 
 			NodeType::Leader(_) => {
-				// send append entries, or store it to be sent on heartbeat timeout
-				unimplemented!()
+				match req {
+					ClientRequest::Read(_client, _read_req) => unimplemented!(),
+					ClientRequest::Apply(client, new_entry) => {
+						// append to local log
+						let log_idx = self
+							.hard_state
+							.append_entry((self.hard_state.curr_term, new_entry));
+
+						// add client addr to map in case we should return something
+						self.client_addrs.insert(log_idx, client);
+						self._send_entries(false)
+					}
+				}
 			}
 		}
 	}
@@ -289,24 +299,7 @@ where
 						// send append entries to all nodes
 						self.next_deadline = at + self.heartbeat_timeout;
 
-						// TODO adapt message with entry log logic later
-						self
-							.other_addrs
-							.iter()
-							.map(|addr| {
-								Message::Node(
-									addr.clone(),
-									NodeMessage::AppendReq(AppendEntries {
-										term: self.hard_state.curr_term,
-										leader_id: self.my_id,
-										leader_commit: self.soft_state.commit_index,
-										prev_log_index: 0,
-										prev_log_term: 0,
-										entries: vec![],
-									}),
-								)
-							})
-							.collect()
+						self._send_entries(true)
 					}
 				}
 			}
@@ -337,6 +330,42 @@ where
 		}
 	}
 
+	fn _send_entries(&mut self, empty: bool) -> Vec<Message<NA, ENT, CA, RES>> {
+		match &self.curr_type {
+			NodeType::Leader(leader_data) => self
+				.other_addrs
+				.iter()
+				.enumerate()
+				.filter_map(|(i, other)| {
+					let next_index = leader_data.next_index[i];
+
+					if !empty && self.hard_state.last_entry() < next_index {
+						None
+					} else {
+						Some(Message::Node(
+							other.clone(),
+							NodeMessage::AppendReq(AppendEntries {
+								term: self.hard_state.curr_term,
+								leader_id: self.my_id,
+								leader_commit: self.soft_state.commit_index,
+								prev_log_index: next_index - 1,
+								prev_log_term: self.hard_state.get_term(next_index - 1).unwrap(),
+								entries: {
+									if !empty {
+										Vec::from(self.hard_state.get_entries(next_index))
+									} else {
+										vec![]
+									}
+								},
+							}),
+						))
+					}
+				})
+				.collect(),
+			_ => unreachable!(),
+		}
+	}
+
 	fn _handle_append_entries(&mut self, req: &AppendEntries<NA, ENT>) -> Message<NA, ENT, CA, RES> {
 		if req.term < self.hard_state.curr_term
 			|| !self
@@ -347,12 +376,24 @@ where
 				req.leader_id,
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
-					success: false,
+					success: None,
 				}),
 			)
 		} else {
-			// TODO - conflicts should be deleted
-			// TODO - append any new entries
+			// delete conflicts & append new entries
+			for (idx, (term, _)) in req.entries.iter().enumerate() {
+				let start = req.prev_log_index + (idx as LogIndex);
+				if start > self.hard_state.last_entry() {
+					self.hard_state.append_entries(&req.entries[idx..]);
+					break;
+				} else if self.hard_state.get_entry(start).0 != *term {
+					self
+						.hard_state
+						.update_entries(start, &req.entries[idx..])
+						.unwrap();
+					break;
+				}
+			}
 
 			if req.leader_commit > self.soft_state.commit_index {
 				self.soft_state.commit_index = min(req.leader_commit, self.hard_state.last_entry());
@@ -362,7 +403,7 @@ where
 				req.leader_id,
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
-					success: true,
+					success: Some(self.hard_state.last_entry()),
 				}),
 			)
 		}
@@ -399,24 +440,7 @@ where
 			self.hard_state.last_entry(),
 		));
 
-		// TODO adapt message with correct prev_log_*
-		self
-			.other_addrs
-			.iter()
-			.map(|addr| {
-				Message::Node(
-					addr.clone(),
-					NodeMessage::AppendReq(AppendEntries {
-						term: self.hard_state.curr_term,
-						leader_id: self.my_id,
-						leader_commit: self.soft_state.commit_index,
-						prev_log_index: 0,
-						prev_log_term: 0,
-						entries: vec![],
-					}),
-				)
-			})
-			.collect()
+		self._send_entries(true)
 	}
 
 	fn _start_election(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
@@ -453,7 +477,7 @@ where
 					if self.client_addrs.contains_key(&idx) {
 						to_ret.push(Message::Client(
 							self.client_addrs[&idx].clone(),
-							ClientResponse::Response(self.statemachine.apply(self.hard_state.get_entry(idx))),
+							ClientResponse::Response(self.statemachine.apply(&self.hard_state.get_entry(idx).1)),
 						));
 					}
 				}

@@ -32,7 +32,10 @@ pub trait Storage<'a, A, E>: Debug {
 	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, E)]);
 }
 
-impl<'a, A, E> PersistentData<'a, A, E> {
+impl<'a, A, E> PersistentData<'a, A, E>
+where
+	E: Clone,
+{
 	pub fn init(storage: Box<dyn Storage<'a, A, E> + 'a>) -> Self {
 		Self {
 			storage,
@@ -81,21 +84,50 @@ impl<'a, A, E> PersistentData<'a, A, E> {
 	}
 
 	/* Log related stuff */
-	pub fn get_entry(&self, index: LogIndex) -> &E {
+	pub fn get_entry(&self, index: LogIndex) -> &(Term, E) {
 		if index <= self.first_index {
 			panic!("bad index query");
 		} else {
-			&self.entries[(index - self.first_index - 1) as usize].1
+			&self.entries[(index - self.first_index - 1) as usize]
 		}
 	}
 
-	pub fn append_entries(&mut self, new_entries: &mut Vec<(Term, E)>) {
+	pub fn get_entries(&self, start: LogIndex) -> &[(Term, E)] {
+		if start <= self.first_index {
+			panic!("bad index query");
+		} else {
+			let offs = (start - self.first_index - 1) as usize;
+			&self.entries[offs..]
+		}
+	}
+
+	pub fn append_entry(&mut self, new_entry: (Term, E)) -> LogIndex {
+		self.append_entries(&mut vec![new_entry]);
+		self.last_entry()
+	}
+
+	pub fn append_entries(&mut self, new_entries: &[(Term, E)]) {
 		if !new_entries.is_empty() {
 			self.dirty_begin = Some(match self.dirty_begin {
 				Some(db) => min(db, self.last_entry() + 1),
 				None => self.last_entry() + 1,
 			});
-			self.entries.append(new_entries);
+			self.entries.extend_from_slice(new_entries);
+		}
+	}
+
+	pub fn update_entries(&mut self, start: LogIndex, new_entries: &[(Term, E)]) -> Result<(), ()> {
+		if start > self.last_entry() + 1 {
+			Err(())
+		} else if start == self.last_entry() + 1 {
+			self.append_entries(new_entries);
+			Ok(())
+		} else {
+			let remaining = start - self.first_index;
+			self.entries.truncate(remaining as usize);
+			self.dirty_begin = Some(self.last_entry() + 1);
+			self.append_entries(new_entries);
+			Ok(())
 		}
 	}
 
@@ -128,5 +160,19 @@ impl<'a, A, E> PersistentData<'a, A, E> {
 
 	pub fn last_entry(&self) -> LogIndex {
 		self.first_index + (self.entries.len() as LogIndex)
+	}
+
+	pub fn get_term(&self, idx: LogIndex) -> Result<Term, ()> {
+		let offs = idx - self.first_index;
+
+		if idx < self.first_index {
+			Err(())
+		} else if idx == self.first_index {
+			Ok(self.first_term)
+		} else if idx > self.last_entry() {
+			Err(())
+		} else {
+			Ok(self.entries[offs as usize].0)
+		}
 	}
 }

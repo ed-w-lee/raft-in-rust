@@ -7,13 +7,13 @@ pub struct AppendEntries<NA, ENT> {
 	pub leader_commit: LogIndex,
 	pub prev_log_index: LogIndex,
 	pub prev_log_term: Term,
-	pub entries: Vec<ENT>,
+	pub entries: Vec<(Term, ENT)>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct AppendEntriesResponse {
 	pub term: Term,
-	pub success: bool,
+	pub success: Option<LogIndex>,
 }
 
 #[derive(Debug, PartialEq)]

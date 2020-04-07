@@ -41,13 +41,14 @@ where
 
 		serial.extend_from_slice(&(self.entries.len() as u64).to_be_bytes());
 		for entry in &self.entries {
-			let entry_bytes = entry.to_bytes();
+			serial.extend_from_slice(&entry.0.to_be_bytes());
+			let entry_bytes = entry.1.to_bytes();
 			serial.extend_from_slice(&entry_bytes);
 		}
 
 		let total_len = serial.len();
 		let mut to_ret = vec![];
-		to_ret.extend_from_slice(&total_len.to_be_bytes());
+		to_ret.extend_from_slice(&(total_len as u64).to_be_bytes());
 
 		to_ret.append(&mut serial);
 		to_ret
@@ -82,12 +83,16 @@ where
 		buf = shift(buf, size_of::<Term>());
 
 		let num_entries = check(into_u64(buf))? as usize;
-		let mut entries: Vec<E> = vec![];
+		let mut entries = vec![];
 		buf = shift(buf, size_of::<u64>());
+		println!("{}", num_entries);
 		for _i in 0..num_entries {
+			let ent_term = check(into_term(buf))?;
+			buf = shift(buf, size_of::<Term>());
+
 			let ent = E::from_bytes(buf)?;
 			let num_bytes = ent.0;
-			entries.push(*ent.1);
+			entries.push((ent_term, *ent.1));
 			buf = shift(buf, num_bytes);
 		}
 
@@ -110,21 +115,44 @@ impl Serialize for AppendEntriesResponse {
 		let mut serial = vec![];
 
 		serial.extend_from_slice(&self.term.to_be_bytes());
-		serial.push(if self.success { 1u8 } else { 0u8 });
+		match self.success {
+			Some(idx) => {
+				serial.push(1u8);
+				serial.extend_from_slice(&idx.to_be_bytes());
+			}
+			None => {
+				serial.push(0u8);
+			}
+		}
 
-		serial
+		let mut to_ret = vec![];
+		to_ret.extend_from_slice(&(serial.len() as usize).to_be_bytes());
+		to_ret.append(&mut serial);
+
+		to_ret
 	}
 
 	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
-		let total_len = size_of::<Term>() + size_of::<u8>();
+		let total_len = size_of::<u64>()
+			+ match into_u64(buf) {
+				Some(v) => v,
+				None => return Err(SerialStatus::Incomplete),
+			} as usize;
+
 		if buf.len() < total_len {
 			return Err(SerialStatus::Incomplete);
 		}
+		let mut buf = shift(buf, size_of::<u64>());
 
 		let term = check(into_term(buf))?;
-		let buf = shift(buf, size_of::<Term>());
+		buf = shift(buf, size_of::<Term>());
 
-		let success: bool = if buf[0] > 0 { true } else { false };
+		let success = if buf[0] > 0 {
+			buf = shift(buf, 1);
+			Some(check(into_index(buf))?)
+		} else {
+			None
+		};
 
 		Ok((total_len, Box::new(Self { term, success })))
 	}
@@ -322,7 +350,7 @@ mod tests {
 			leader_commit: 20,
 			prev_log_index: 30,
 			prev_log_term: 16,
-			entries: [120, 1525, 480848].to_vec(),
+			entries: [(10, 120), (20, 1525), (30, 480848)].to_vec(),
 		};
 		let bytes = ae.to_bytes();
 		println!("{:?}", bytes);
@@ -345,7 +373,7 @@ mod tests {
 			leader_commit: 20,
 			prev_log_index: 30,
 			prev_log_term: 16,
-			entries: [120, 1525, 480848].to_vec(),
+			entries: [(10, 120), (20, 1525), (30, 480848)].to_vec(),
 		};
 		let bytes = ae.to_bytes();
 		assert_eq!(
@@ -362,11 +390,12 @@ mod tests {
 			leader_commit: 20,
 			prev_log_index: 30,
 			prev_log_term: 16,
-			entries: [120, 1525, 480848].to_vec(),
+			entries: [(10, 120), (20, 1525), (30, 480848)].to_vec(),
 		};
 		let mut bytes = ae.to_bytes();
-		bytes.truncate(bytes.len() / 2 + 3);
-		bytes.append(&mut bytes.clone());
+		let mut orig_bytes = bytes.clone();
+		bytes.truncate(20);
+		bytes.append(&mut orig_bytes);
 		assert_eq!(
 			Err(SerialStatus::Error),
 			AppendEntries::<IpAddr, u64>::from_bytes(&bytes[..bytes.len()])
@@ -381,7 +410,7 @@ mod tests {
 			leader_commit: 20,
 			prev_log_index: 30,
 			prev_log_term: 16,
-			entries: [120, 1525, 480848].to_vec(),
+			entries: [(10, 120), (20, 1525), (30, 480848)].to_vec(),
 		};
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();
@@ -401,7 +430,7 @@ mod tests {
 	fn test_append_res_convert() {
 		let ae: AppendEntriesResponse = AppendEntriesResponse {
 			term: 10,
-			success: true,
+			success: Some(10),
 		};
 		let bytes = ae.to_bytes();
 		match AppendEntriesResponse::from_bytes(&bytes) {
@@ -419,7 +448,7 @@ mod tests {
 	fn test_append_res_incomplete() {
 		let ae: AppendEntriesResponse = AppendEntriesResponse {
 			term: 10,
-			success: true,
+			success: Some(10),
 		};
 		let bytes = ae.to_bytes();
 		assert_eq!(
@@ -432,7 +461,7 @@ mod tests {
 	fn test_append_res_extend() {
 		let ae: AppendEntriesResponse = AppendEntriesResponse {
 			term: 10,
-			success: true,
+			success: Some(10),
 		};
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();

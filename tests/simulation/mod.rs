@@ -1,4 +1,4 @@
-use rafted::message::{Message, NodeMessage};
+use rafted::message::{ClientRequest, Message, NodeMessage};
 use rafted::statemachine::StateMachine;
 use rafted::{LogIndex, Node, NodeStatus, PersistentData, Storage, Term};
 
@@ -422,7 +422,7 @@ impl<'a> Simulation<'a> {
 		}
 	}
 
-	pub fn client_msg(&mut self) {
+	pub fn client_msg(&mut self, req: ClientRequest<ClientAddr, (), Entry>) {
 		// TODO - once client messages work
 		unimplemented!()
 	}

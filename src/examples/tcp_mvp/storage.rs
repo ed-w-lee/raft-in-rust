@@ -114,7 +114,7 @@ where
 impl<'a, A, E> Storage<'a, A, E> for FileStorage<A, E>
 where
 	A: Debug + Serialize + 'a,
-	E: Debug + Serialize + 'a,
+	E: Debug + Serialize + Clone + 'a,
 {
 	fn get_data(mut self) -> PersistentData<'a, A, E> {
 		match self._get_data() {

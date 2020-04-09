@@ -230,6 +230,13 @@ where
 							// node is up-to-date until given idx
 							lead.match_index[other_idx] = log_idx;
 							lead.next_index[other_idx] = log_idx + 1;
+
+							let mut find_commit = lead.match_index.clone();
+							find_commit.sort();
+							// 4 other_addrs requires 2
+							// 5 other_addrs requires 3
+							let next_commit = find_commit[(self.other_addrs.len() + 1) / 2];
+							self.soft_state.commit_index = next_commit;
 						}
 						None => {
 							// get idx
@@ -357,7 +364,7 @@ where
 
 	fn _send_entries(&mut self, empty: bool) -> Vec<Message<NA, ENT, CA, RES>> {
 		match &self.curr_type {
-			NodeType::Leader(leader_data) => self
+			NodeType::Leader(_) => self
 				.other_addrs
 				.iter()
 				.filter_map(|other| self.send_entries_to_node(other.clone(), empty))
@@ -490,6 +497,8 @@ where
 		self.hard_state.voted_for = Some(self.my_id);
 		self.next_deadline = at + self.election_timeout;
 
+		let my_last_idx = self.hard_state.last_entry();
+		let my_last_term = self.hard_state.get_term(my_last_idx).unwrap();
 		self
 			.other_addrs
 			.iter()
@@ -499,8 +508,8 @@ where
 					NodeMessage::VoteReq(RequestVote {
 						term: self.hard_state.curr_term,
 						candidate_id: self.my_id,
-						last_log_index: 0,
-						last_log_term: 0,
+						last_log_index: my_last_idx,
+						last_log_term: my_last_term,
 					}),
 				)
 			})
@@ -519,6 +528,7 @@ where
 							self.client_addrs[&idx].clone(),
 							ClientResponse::Response(self.statemachine.apply(&self.hard_state.get_entry(idx).1)),
 						));
+						self.client_addrs.remove_entry(&idx);
 					}
 				}
 				_ => {}

@@ -1,6 +1,6 @@
 use crate::types::{LogIndex, Term};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct AppendEntries<NA, ENT> {
 	pub term: Term,
 	pub leader_id: NA,
@@ -10,14 +10,14 @@ pub struct AppendEntries<NA, ENT> {
 	pub entries: Vec<(Term, ENT)>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct AppendEntriesResponse<NA> {
 	pub term: Term,
 	pub from: NA,
 	pub success: Option<LogIndex>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct RequestVote<NA> {
 	pub term: Term,
 	pub candidate_id: NA,
@@ -25,14 +25,14 @@ pub struct RequestVote<NA> {
 	pub last_log_term: Term,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct RequestVoteResponse<NA> {
 	pub term: Term,
 	pub from: NA,
 	pub vote_granted: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum NodeMessage<NA, ENT> {
 	AppendReq(AppendEntries<NA, ENT>),
 	AppendRes(AppendEntriesResponse<NA>),
@@ -69,6 +69,7 @@ where
 	}
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum ClientResponse<NA, RES> {
 	Response(RES),
 	Redirect(NA),
@@ -76,6 +77,7 @@ pub enum ClientResponse<NA, RES> {
 }
 
 /// Messages from a node to either another node or a client
+#[derive(Clone)]
 pub enum Message<NA, ENT, CA, RES> {
 	Node(NA, NodeMessage<NA, ENT>),
 	Client(CA, ClientResponse<NA, RES>),

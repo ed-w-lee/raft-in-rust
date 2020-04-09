@@ -77,10 +77,17 @@ where
 			self.first_term,
 		);
 		if let Some(db) = self.dirty_begin {
-			self
-				.storage
-				.update_entries(db, &self.entries.get((db as usize)..).unwrap_or(&[]));
+			if db == self.first_index {
+				assert!(self.entries.is_empty());
+				self.storage.update_entries(db, &[]);
+			} else {
+				assert!(db > self.first_index);
+				self
+					.storage
+					.update_entries(db, &self.entries.get(((db - 1) as usize)..).unwrap_or(&[]));
+			}
 		}
+		self.dirty_begin = None;
 	}
 
 	/* Log related stuff */

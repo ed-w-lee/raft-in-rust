@@ -1,7 +1,8 @@
 use rafted::{NodeRole, NodeStatus, Term};
 
-mod simulation;
-use simulation::{NodeId, Simulation, SimulationOpts};
+mod test_utils;
+use test_utils::simulation::{NodeId, Simulation, SimulationOpts};
+use test_utils::{partition, run_for_and_get_leader};
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -103,46 +104,18 @@ fn it_chooses_new_leader_when_leader_stops() {
 	})
 	.expect("couldn't convert from given options");
 
-	let mut curr_leader: Option<NodeId> = None;
-	sim.run_for(1000, &mut |statuses: Vec<Option<NodeStatus<NodeId>>>| {
-		let leaders: Vec<NodeStatus<NodeId>> = statuses
-			.into_iter()
-			.filter(|status| status.is_some())
-			.map(|status| status.unwrap())
-			.filter(|status| status.role == NodeRole::Leader)
-			.collect();
+	let leader = run_for_and_get_leader(&mut sim, 1000);
 
-		if leaders.is_empty() {
-			curr_leader = None
-		} else {
-			curr_leader = Some(leaders[0].id)
-		}
-	});
+	sim.stop_node(leader);
 
-	assert!(curr_leader.is_some());
-	sim.stop_node(curr_leader.unwrap());
+	let new_leader = run_for_and_get_leader(&mut sim, 1000);
 
-	sim.run_for(1000, &mut |_statuses: Vec<Option<NodeStatus<NodeId>>>| {});
+	sim.start_node(leader, sim.next_event_time());
 
-	sim.start_node(curr_leader.unwrap(), sim.next_event_time());
-	let mut new_leader: Option<NodeId> = None;
-	sim.run_for(1000, &mut |statuses: Vec<Option<NodeStatus<NodeId>>>| {
-		let leaders: Vec<NodeStatus<NodeId>> = statuses
-			.into_iter()
-			.filter(|status| status.is_some())
-			.map(|status| status.unwrap())
-			.filter(|status| status.role == NodeRole::Leader)
-			.collect();
+	let new_new_leader = run_for_and_get_leader(&mut sim, 1000);
 
-		if leaders.is_empty() {
-			new_leader = None
-		} else {
-			new_leader = Some(leaders[0].id)
-		}
-	});
-
-	assert!(new_leader.is_some());
-	assert_ne!(curr_leader.unwrap(), new_leader.unwrap());
+	assert_ne!(leader, new_leader);
+	assert_eq!(new_leader, new_new_leader);
 }
 
 #[test]
@@ -156,36 +129,9 @@ fn it_chooses_new_leader_after_partition() {
 	})
 	.expect("couldn't convert from given options");
 
-	let mut curr_leader: Option<NodeId> = None;
-	sim.run_for(1000, &mut |statuses: Vec<Option<NodeStatus<NodeId>>>| {
-		let leaders: Vec<NodeStatus<NodeId>> = statuses
-			.into_iter()
-			.filter(|status| status.is_some())
-			.map(|status| status.unwrap())
-			.filter(|status| status.role == NodeRole::Leader)
-			.collect();
+	let curr_leader = run_for_and_get_leader(&mut sim, 1000);
 
-		if leaders.is_empty() {
-			curr_leader = None
-		} else {
-			curr_leader = Some(leaders[0].id)
-		}
-	});
-
-	assert!(curr_leader.is_some());
-	let curr_leader = curr_leader.unwrap();
-	let conns_to_drop = [
-		(curr_leader, (curr_leader + 2) % 5),
-		(curr_leader, (curr_leader + 3) % 5),
-		(curr_leader, (curr_leader + 4) % 5),
-		((curr_leader + 1) % 5, (curr_leader + 2) % 5),
-		((curr_leader + 1) % 5, (curr_leader + 3) % 5),
-		((curr_leader + 1) % 5, (curr_leader + 4) % 5),
-	];
-	conns_to_drop.iter().for_each(|tup| {
-		sim.drop_conn(tup.0, tup.1);
-		sim.drop_conn(tup.1, tup.0);
-	});
+	partition(&mut sim, true, 5, vec![curr_leader, (curr_leader + 1) % 5]);
 
 	sim.run_for(1000, &mut |_statuses: Vec<Option<NodeStatus<NodeId>>>| {});
 
@@ -221,10 +167,8 @@ fn it_chooses_new_leader_after_partition() {
 	let new_leader_term = new_leader_term.unwrap();
 	assert_ne!(curr_leader, new_leader);
 
-	conns_to_drop.iter().for_each(|tup| {
-		sim.enable_conn(tup.0, tup.1);
-		sim.enable_conn(tup.1, tup.0);
-	});
+	// heal partition
+	partition(&mut sim, false, 5, vec![curr_leader, (curr_leader + 1) % 5]);
 
 	let mut final_leader: Option<NodeId> = None;
 	sim.run_for(1000, &mut |statuses: Vec<Option<NodeStatus<NodeId>>>| {

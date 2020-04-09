@@ -1,13 +1,13 @@
-use rafted::message::ClientRequest;
-use rafted::{NodeRole, NodeStatus};
+use rafted::message::{ClientRequest, ClientResponse};
 
-mod simulation;
-use simulation::{ClientAddr, Entry, NodeId, Simulation, SimulationOpts};
+mod test_utils;
+use test_utils::run_for_and_get_leader;
+use test_utils::simulation::{Simulation, SimulationOpts};
 
 use std::convert::TryFrom;
 
 #[test]
-fn it_replicates_correctly() {
+fn it_commits_correctly() {
 	let mut sim = Simulation::try_from(SimulationOpts {
 		num_nodes: 5,
 		election_timeout: None,
@@ -17,39 +17,64 @@ fn it_replicates_correctly() {
 	})
 	.expect("couldn't convert from given options");
 
-	let mut curr_leader: Option<NodeId> = None;
-	sim.run_for(3000, &mut |statuses| {
-		let leaders: Vec<NodeStatus<NodeId>> = statuses
-			.into_iter()
-			.filter(|status| status.is_some())
-			.map(|status| status.unwrap())
-			.filter(|status| status.role == NodeRole::Leader)
-			.collect();
+	let leader = run_for_and_get_leader(&mut sim, 3000);
+	sim.client_msg(leader, ClientRequest::Apply(0, 10));
+	sim.client_msg(leader, ClientRequest::Apply(0, 20));
+	sim.client_msg(leader, ClientRequest::Apply(0, 30));
 
-		if leaders.is_empty() {
-			curr_leader = None
-		} else {
-			curr_leader = Some(leaders[0].id)
-		}
-	});
-	assert!(curr_leader.is_some());
-	let leader = curr_leader.unwrap();
-	sim.client_msg(leader, ClientRequest::<ClientAddr, (), Entry>::Apply(0, 10));
-	sim.client_msg(leader, ClientRequest::<ClientAddr, (), Entry>::Apply(0, 20));
-	sim.client_msg(leader, ClientRequest::<ClientAddr, (), Entry>::Apply(0, 30));
+	sim.run_for(300, &mut |_| {});
 
-	sim.run_for(300, &mut |statuses| {
-		let leaders: Vec<NodeStatus<NodeId>> = statuses
-			.into_iter()
-			.filter(|status| status.is_some())
-			.map(|status| status.unwrap())
-			.filter(|status| status.role == NodeRole::Leader)
-			.collect();
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(10u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(20u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(30u64));
+}
 
-		if leaders.is_empty() {
-			curr_leader = None
-		} else {
-			curr_leader = Some(leaders[0].id)
-		}
-	});
+#[test]
+fn it_commits_correctly_after_leader_down() {
+	let mut sim = Simulation::try_from(SimulationOpts {
+		num_nodes: 5,
+		election_timeout: None,
+		heartbeat_timeout: None,
+		msg_delay: None,
+		seed: None,
+	})
+	.expect("couldn't convert from given options");
+
+	let leader = run_for_and_get_leader(&mut sim, 3000);
+	sim.client_msg(leader, ClientRequest::Apply(0, 10));
+	sim.client_msg(leader, ClientRequest::Apply(0, 20));
+	sim.client_msg(leader, ClientRequest::Apply(0, 30));
+
+	sim.run_for(300, &mut |_| {});
+
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(10u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(20u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(30u64));
+
+	sim.run_for(300, &mut |_| {});
+
+	sim.stop_node(leader);
+
+	let int_leader = run_for_and_get_leader(&mut sim, 400);
+
+	sim.stop_node(int_leader);
+
+	let new_leader = run_for_and_get_leader(&mut sim, 500);
+	sim.client_msg(new_leader, ClientRequest::Apply(0, 40));
+	sim.client_msg(new_leader, ClientRequest::Apply(0, 50));
+	sim.client_msg(new_leader, ClientRequest::Apply(0, 60));
+
+	sim.run_for(300, &mut |_| {});
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(40u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(50u64));
+	let response = sim.recv_client_res(&0).unwrap();
+	assert_eq!(response, ClientResponse::Response(60u64));
 }

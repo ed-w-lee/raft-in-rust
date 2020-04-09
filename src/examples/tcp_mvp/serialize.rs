@@ -152,14 +152,17 @@ where
 		let term = check(into_term(buf))?;
 		buf = shift(buf, size_of::<Term>());
 
-		let success = if buf[0] > 0 {
-			buf = shift(buf, 1);
-			Some(check(into_index(buf))?)
-		} else {
-			None
+		let success = {
+			if buf[0] > 0 {
+				buf = shift(buf, 1);
+				let to_ret = Some(check(into_index(buf))?);
+				buf = shift(buf, size_of::<LogIndex>());
+				to_ret
+			} else {
+				buf = shift(buf, 1);
+				None
+			}
 		};
-
-		buf = shift(buf, size_of::<Term>());
 
 		let tup = NA::from_bytes(buf)?;
 		let (_, from) = tup;
@@ -475,6 +478,25 @@ mod tests {
 			term: 10,
 			from: 15,
 			success: Some(10),
+		};
+		let bytes = ae.to_bytes();
+		match AppendEntriesResponse::<u64>::from_bytes(&bytes) {
+			Ok(tup) => {
+				let len = tup.0;
+				let ae_new = tup.1;
+				assert_eq!(len, bytes.len());
+				assert_eq!(ae, *ae_new);
+			}
+			Err(_) => assert!(false),
+		}
+	}
+
+	#[test]
+	fn test_append_res_none_convert() {
+		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
+			term: 10,
+			from: 15,
+			success: None,
 		};
 		let bytes = ae.to_bytes();
 		match AppendEntriesResponse::<u64>::from_bytes(&bytes) {

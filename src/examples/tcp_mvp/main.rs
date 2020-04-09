@@ -106,21 +106,29 @@ fn main() {
 					let node_msgs = conn_manager.get_node_msgs();
 
 					node_msgs.iter().for_each(|(_k, v)| {
-						for msg in v {
-							for to_send in node.receive(msg, Instant::now()) {
-								conn_manager.send_message(to_send);
-							}
-						}
+						v.into_iter().for_each(|msg| {
+							node
+								.receive(msg, Instant::now())
+								.into_iter()
+								.for_each(|to_send| {
+									conn_manager.send_message(to_send);
+								})
+						});
 					});
 
 					// then handle messages from clients
 					let client_msgs = conn_manager.get_client_msgs();
-					for (k, v) in client_msgs {
-						for val in v {
+					client_msgs.into_iter().for_each(|(k, v)| {
+						v.into_iter().for_each(|val| {
 							let client_req = ClientRequest::Apply(k, val);
-							node.receive_client(client_req, Instant::now());
-						}
-					}
+							node
+								.receive_client(client_req, Instant::now())
+								.into_iter()
+								.for_each(|msg| {
+									conn_manager.send_message(msg);
+								});
+						})
+					});
 
 					conn_manager.regenerate_pollfds();
 				}

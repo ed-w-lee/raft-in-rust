@@ -171,7 +171,8 @@ where
 			.seek(SeekFrom::Start(0))
 			.expect("couldn't seek to start");
 
-		if entries.is_empty() && start == 0 {
+		if start == 0 {
+			assert!(entries.is_empty());
 			// handle empty case
 			self
 				.entries_file

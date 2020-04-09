@@ -268,12 +268,16 @@ where
 			Message::Client(addr, res) => match res {
 				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string()),
 				ClientResponse::Redirect(a) => {
+					// TODO close connection
 					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()))
 				}
-				ClientResponse::TryAgain => self.send_client(
-					&addr,
-					"no known leader. try again another node another time",
-				),
+				ClientResponse::TryAgain => {
+					// TODO close connection
+					self.send_client(
+						&addr,
+						"no known leader. try again another node another time",
+					)
+				}
 			},
 		}
 	}

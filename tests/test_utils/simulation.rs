@@ -1,10 +1,10 @@
-use rafted::message::{ClientRequest, Message, NodeMessage};
+use rafted::message::{ClientRequest, ClientResponse, Message, NodeMessage};
 use rafted::statemachine::StateMachine;
 use rafted::{LogIndex, Node, NodeStatus, PersistentData, Storage, Term};
 
 use std::cell::RefCell;
 use std::cmp::{min, Ord, Ordering, PartialOrd};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
@@ -194,6 +194,7 @@ pub struct Simulation<'a> {
 	nodes: Vec<Option<Node<'a, NodeId, Entry, ClientAddr, (), ClientRes, SimStateMachine>>>,
 	messages: BinaryHeap<SimMessage>,
 	next_tick: Vec<Instant>,
+	client_responses: HashMap<ClientAddr, VecDeque<ClientResponse<NodeId, ClientRes>>>,
 }
 
 pub struct SimulationOpts {
@@ -290,6 +291,7 @@ impl<'a> TryFrom<SimulationOpts> for Simulation<'a> {
 			nodes,
 			messages: BinaryHeap::new(),
 			next_tick,
+			client_responses: HashMap::new(),
 		})
 	}
 }
@@ -418,7 +420,6 @@ impl<'a> Simulation<'a> {
 	}
 
 	pub fn client_msg(&mut self, to: NodeId, req: ClientRequest<ClientAddr, (), Entry>) {
-		// TODO - once client messages work
 		let at = self.last_event + CLIENT_OFFS;
 		if let Some(node) = &mut self.nodes[to as usize] {
 			let msgs_to_send = node.receive_client(req, at);
@@ -427,6 +428,14 @@ impl<'a> Simulation<'a> {
 				self.register_msg(to, to_send, at);
 			}
 		}
+	}
+
+	pub fn recv_client_res(
+		&mut self,
+		client: &ClientAddr,
+	) -> Option<ClientResponse<NodeId, ClientRes>> {
+		let responses = self.client_responses.get_mut(client)?;
+		responses.pop_front()
 	}
 
 	fn register_msg(
@@ -445,10 +454,16 @@ impl<'a> Simulation<'a> {
 					});
 				}
 			}
-			Message::Client(_, _) => {
-				// just don't do anything for right now
-				// TODO - allow clients to receive messages in simulation
-				()
+			Message::Client(client, msg) => {
+				println!("test");
+				if !self.client_responses.contains_key(&client) {
+					self.client_responses.insert(client, VecDeque::new());
+				}
+				self
+					.client_responses
+					.get_mut(&client)
+					.unwrap()
+					.push_back(msg);
 			}
 		}
 	}

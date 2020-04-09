@@ -7,8 +7,10 @@ use crate::statemachine::StateMachine;
 use crate::types::{LogIndex, Term};
 
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
+use std::hash::Hash;
+use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
@@ -22,13 +24,13 @@ struct LeaderData {
 	match_index: Vec<LogIndex>,
 }
 
-struct CandidateData {
-	votes: usize,
+struct CandidateData<NA> {
+	votes: HashSet<NA>,
 }
 
-enum NodeType {
+enum NodeType<NA> {
 	Leader(LeaderData),
-	Candidate(CandidateData),
+	Candidate(CandidateData<NA>),
 	Follower,
 }
 
@@ -56,7 +58,7 @@ pub struct NodeStatus<A> {
 /// RES - client response
 /// SM - state machine
 pub struct Node<'a, NA, ENT, CA, REQ, RES, SM> {
-	curr_type: NodeType,
+	curr_type: NodeType<NA>,
 	my_id: NA,
 	other_addrs: Vec<NA>,
 
@@ -116,9 +118,10 @@ impl LeaderData {
 // Assumes that {receive, propose, tick} will be called with an `at` that monotonically increases
 impl<'a, NA, ENT, CA, REQ, RES, SM> Node<'a, NA, ENT, CA, REQ, RES, SM>
 where
-	NA: Eq + Copy + Clone + Debug,
-	ENT: Debug + Clone,
-	CA: Clone,
+	NA: Eq + Copy + Clone + Debug + Hash,
+	ENT: Clone + Debug,
+	CA: Clone + Debug,
+	REQ: Debug,
 	SM: StateMachine<REQ, ENT, RES>,
 {
 	pub fn new(
@@ -201,12 +204,10 @@ where
 					// we know this is going to reject, but whatever
 					NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req)],
 					NodeMessage::VoteRes(res) => {
-						// TODO - we may want to use set of nodes to avoid replay
-						// (that's not in our current failure model afaik)
 						if res.vote_granted {
-							cand.votes += 1;
+							cand.votes.insert(res.from);
 
-							if cand.votes > (self.other_addrs.len() + 1) / 2 {
+							if cand.votes.len() > (self.other_addrs.len() + 1) / 2 {
 								return self._to_leader(at);
 							}
 						}
@@ -215,8 +216,31 @@ where
 					NodeMessage::AppendRes(_) => vec![],
 				}
 			}
-			NodeType::Leader(_) => match msg {
-				NodeMessage::AppendRes(res) => unimplemented!(),
+			NodeType::Leader(lead) => match msg {
+				NodeMessage::AppendRes(res) => {
+					let other_idx: usize = self
+						.other_addrs
+						.iter()
+						.position(|&a| a == res.from)
+						.unwrap();
+
+					match res.success {
+						Some(log_idx) => {
+							assert!(lead.next_index[other_idx] <= log_idx + 1);
+							// node is up-to-date until given idx
+							lead.match_index[other_idx] = log_idx;
+							lead.next_index[other_idx] = log_idx + 1;
+						}
+						None => {
+							// get idx
+							lead.next_index[other_idx] -= 1;
+						}
+					}
+					match self.send_entries_to_node(self.other_addrs[other_idx].clone(), false) {
+						Some(msg) => vec![msg],
+						None => vec![],
+					}
+				}
 				_ => vec![],
 			},
 		}
@@ -241,6 +265,7 @@ where
 		req: ClientRequest<CA, REQ, ENT>,
 		at: Instant,
 	) -> Vec<Message<NA, ENT, CA, RES>> {
+		println!("received at {:?} for {:?} -- message: {:?}", at, self, req);
 		match &self.curr_type {
 			NodeType::Candidate(_) => match self.last_known_leader {
 				Some(node) => vec![Message::Client(
@@ -335,35 +360,45 @@ where
 			NodeType::Leader(leader_data) => self
 				.other_addrs
 				.iter()
-				.enumerate()
-				.filter_map(|(i, other)| {
-					let next_index = leader_data.next_index[i];
-
-					if !empty && self.hard_state.last_entry() < next_index {
-						None
-					} else {
-						Some(Message::Node(
-							other.clone(),
-							NodeMessage::AppendReq(AppendEntries {
-								term: self.hard_state.curr_term,
-								leader_id: self.my_id,
-								leader_commit: self.soft_state.commit_index,
-								prev_log_index: next_index - 1,
-								prev_log_term: self.hard_state.get_term(next_index - 1).unwrap(),
-								entries: {
-									if !empty {
-										Vec::from(self.hard_state.get_entries(next_index))
-									} else {
-										vec![]
-									}
-								},
-							}),
-						))
-					}
-				})
+				.filter_map(|other| self.send_entries_to_node(other.clone(), empty))
 				.collect(),
 			_ => unreachable!(),
 		}
+	}
+
+	fn send_entries_to_node(&self, addr: NA, empty: bool) -> Option<Message<NA, ENT, CA, RES>> {
+		match &self.curr_type {
+			NodeType::Leader(leader_data) => {
+				let other_idx: usize = self.get_idx_of(addr);
+				let next_index = leader_data.next_index[other_idx];
+				if !empty && self.hard_state.last_entry() < next_index {
+					None
+				} else {
+					Some(Message::Node(
+						addr.clone(),
+						NodeMessage::AppendReq(AppendEntries {
+							term: self.hard_state.curr_term,
+							leader_id: self.my_id,
+							leader_commit: self.soft_state.commit_index,
+							prev_log_index: next_index - 1,
+							prev_log_term: self.hard_state.get_term(next_index - 1).unwrap(),
+							entries: {
+								if !empty {
+									Vec::from(self.hard_state.get_entries(next_index))
+								} else {
+									vec![]
+								}
+							},
+						}),
+					))
+				}
+			}
+			_ => unreachable!(),
+		}
+	}
+
+	fn get_idx_of(&self, addr: NA) -> usize {
+		self.other_addrs.iter().position(|&a| a == addr).unwrap()
 	}
 
 	fn _handle_append_entries(&mut self, req: &AppendEntries<NA, ENT>) -> Message<NA, ENT, CA, RES> {
@@ -376,13 +411,14 @@ where
 				req.leader_id,
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
+					from: self.my_id,
 					success: None,
 				}),
 			)
 		} else {
 			// delete conflicts & append new entries
 			for (idx, (term, _)) in req.entries.iter().enumerate() {
-				let start = req.prev_log_index + (idx as LogIndex);
+				let start = req.prev_log_index + (idx as LogIndex) + 1;
 				if start > self.hard_state.last_entry() {
 					self.hard_state.append_entries(&req.entries[idx..]);
 					break;
@@ -403,6 +439,7 @@ where
 				req.leader_id,
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
+					from: self.my_id,
 					success: Some(self.hard_state.last_entry()),
 				}),
 			)
@@ -427,6 +464,7 @@ where
 			req.candidate_id,
 			NodeMessage::VoteRes(RequestVoteResponse {
 				term: self.hard_state.curr_term,
+				from: self.my_id,
 				vote_granted,
 			}),
 		)
@@ -444,7 +482,9 @@ where
 	}
 
 	fn _start_election(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
-		self.curr_type = NodeType::Candidate(CandidateData { votes: 1 });
+		self.curr_type = NodeType::Candidate(CandidateData {
+			votes: HashSet::from_iter(vec![self.my_id].iter().cloned()),
+		});
 
 		self.hard_state.curr_term += 1;
 		self.hard_state.voted_for = Some(self.my_id);

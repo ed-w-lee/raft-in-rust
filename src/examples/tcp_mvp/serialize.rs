@@ -110,7 +110,10 @@ where
 	}
 }
 
-impl Serialize for AppendEntriesResponse {
+impl<NA> Serialize for AppendEntriesResponse<NA>
+where
+	NA: Serialize,
+{
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut serial = vec![];
 
@@ -124,6 +127,8 @@ impl Serialize for AppendEntriesResponse {
 				serial.push(0u8);
 			}
 		}
+
+		serial.append(&mut self.from.to_bytes());
 
 		let mut to_ret = vec![];
 		to_ret.extend_from_slice(&(serial.len() as usize).to_be_bytes());
@@ -154,7 +159,19 @@ impl Serialize for AppendEntriesResponse {
 			None
 		};
 
-		Ok((total_len, Box::new(Self { term, success })))
+		buf = shift(buf, size_of::<Term>());
+
+		let tup = NA::from_bytes(buf)?;
+		let (_, from) = tup;
+
+		Ok((
+			total_len,
+			Box::new(Self {
+				term,
+				from: *from,
+				success,
+			}),
+		))
 	}
 }
 
@@ -215,28 +232,54 @@ where
 	}
 }
 
-impl Serialize for RequestVoteResponse {
+impl<A> Serialize for RequestVoteResponse<A>
+where
+	A: Serialize,
+{
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut serial = vec![];
 
+		serial.append(&mut self.from.to_bytes());
 		serial.extend_from_slice(&self.term.to_be_bytes());
 		serial.push(if self.vote_granted { 1u8 } else { 0u8 });
 
-		serial
+		let mut to_ret = vec![];
+		to_ret.extend_from_slice(&(serial.len() as u64).to_be_bytes());
+		to_ret.append(&mut serial);
+
+		to_ret
 	}
 
 	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
-		let total_len = size_of::<Term>() + size_of::<u8>();
+		let total_len = size_of::<u64>()
+			+ match into_u64(buf) {
+				Some(v) => v,
+				None => return Err(SerialStatus::Incomplete),
+			} as usize;
+
 		if buf.len() < total_len {
 			return Err(SerialStatus::Incomplete);
 		}
 
+		let mut buf = shift(buf, size_of::<u64>());
+
+		let tup = A::from_bytes(buf)?;
+		let (to_shift, from) = tup;
+		buf = shift(buf, to_shift);
+
 		let term = check(into_term(buf))?;
-		let buf = shift(buf, size_of::<Term>());
+		buf = shift(buf, size_of::<Term>());
 
 		let vote_granted: bool = if buf[0] > 0 { true } else { false };
 
-		Ok((total_len, Box::new(Self { term, vote_granted })))
+		Ok((
+			total_len,
+			Box::new(Self {
+				term,
+				from: *from,
+				vote_granted,
+			}),
+		))
 	}
 }
 
@@ -428,12 +471,13 @@ mod tests {
 
 	#[test]
 	fn test_append_res_convert() {
-		let ae: AppendEntriesResponse = AppendEntriesResponse {
+		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
+			from: 15,
 			success: Some(10),
 		};
 		let bytes = ae.to_bytes();
-		match AppendEntriesResponse::from_bytes(&bytes) {
+		match AppendEntriesResponse::<u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;
@@ -446,27 +490,29 @@ mod tests {
 
 	#[test]
 	fn test_append_res_incomplete() {
-		let ae: AppendEntriesResponse = AppendEntriesResponse {
+		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
+			from: 15,
 			success: Some(10),
 		};
 		let bytes = ae.to_bytes();
 		assert_eq!(
 			Err(SerialStatus::Incomplete),
-			AppendEntriesResponse::from_bytes(&bytes[..bytes.len() - 3])
+			AppendEntriesResponse::<u64>::from_bytes(&bytes[..bytes.len() - 3])
 		);
 	}
 
 	#[test]
 	fn test_append_res_extend() {
-		let ae: AppendEntriesResponse = AppendEntriesResponse {
+		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
+			from: 15,
 			success: Some(10),
 		};
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();
 		bytes.append(&mut vec![12, 34, 56, 78, 90]);
-		match AppendEntriesResponse::from_bytes(&bytes) {
+		match AppendEntriesResponse::<u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;
@@ -553,12 +599,13 @@ mod tests {
 
 	#[test]
 	fn test_vote_res_convert() {
-		let ae: RequestVoteResponse = RequestVoteResponse {
+		let ae: RequestVoteResponse<u64> = RequestVoteResponse {
 			term: 10,
+			from: 15,
 			vote_granted: true,
 		};
 		let bytes = ae.to_bytes();
-		match RequestVoteResponse::from_bytes(&bytes) {
+		match RequestVoteResponse::<u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;
@@ -571,27 +618,29 @@ mod tests {
 
 	#[test]
 	fn test_vote_res_incomplete() {
-		let ae: RequestVoteResponse = RequestVoteResponse {
+		let ae: RequestVoteResponse<u64> = RequestVoteResponse {
 			term: 10,
+			from: 15,
 			vote_granted: true,
 		};
 		let bytes = ae.to_bytes();
 		assert_eq!(
 			Err(SerialStatus::Incomplete),
-			RequestVoteResponse::from_bytes(&bytes[..bytes.len() - 3])
+			RequestVoteResponse::<u64>::from_bytes(&bytes[..bytes.len() - 3])
 		);
 	}
 
 	#[test]
 	fn test_vote_res_extend() {
-		let ae: RequestVoteResponse = RequestVoteResponse {
+		let ae: RequestVoteResponse<u64> = RequestVoteResponse {
 			term: 10,
+			from: 15,
 			vote_granted: true,
 		};
 		let mut bytes = ae.to_bytes();
 		let orig_len = bytes.len();
 		bytes.append(&mut vec![12, 34, 56, 78, 90]);
-		match RequestVoteResponse::from_bytes(&bytes) {
+		match RequestVoteResponse::<u64>::from_bytes(&bytes) {
 			Ok(tup) => {
 				let len = tup.0;
 				let ae_new = tup.1;

@@ -34,7 +34,7 @@ pub trait Storage<'a, A, E>: Debug {
 
 impl<'a, A, E> PersistentData<'a, A, E>
 where
-	E: Clone,
+	E: Clone + Debug,
 {
 	pub fn init(storage: Box<dyn Storage<'a, A, E> + 'a>) -> Self {
 		Self {
@@ -93,8 +93,10 @@ where
 	}
 
 	pub fn get_entries(&self, start: LogIndex) -> &[(Term, E)] {
-		if start <= self.first_index {
+		if start < self.first_index {
 			panic!("bad index query");
+		} else if start == self.first_index {
+			&[]
 		} else {
 			let offs = (start - self.first_index - 1) as usize;
 			&self.entries[offs..]
@@ -163,8 +165,6 @@ where
 	}
 
 	pub fn get_term(&self, idx: LogIndex) -> Result<Term, ()> {
-		let offs = idx - self.first_index;
-
 		if idx < self.first_index {
 			Err(())
 		} else if idx == self.first_index {
@@ -172,6 +172,7 @@ where
 		} else if idx > self.last_entry() {
 			Err(())
 		} else {
+			let offs = idx - self.first_index - 1;
 			Ok(self.entries[offs as usize].0)
 		}
 	}

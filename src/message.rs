@@ -11,8 +11,9 @@ pub struct AppendEntries<NA, ENT> {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct AppendEntriesResponse {
+pub struct AppendEntriesResponse<NA> {
 	pub term: Term,
+	pub from: NA,
 	pub success: Option<LogIndex>,
 }
 
@@ -25,17 +26,18 @@ pub struct RequestVote<NA> {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RequestVoteResponse {
+pub struct RequestVoteResponse<NA> {
 	pub term: Term,
+	pub from: NA,
 	pub vote_granted: bool,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum NodeMessage<NA, ENT> {
 	AppendReq(AppendEntries<NA, ENT>),
-	AppendRes(AppendEntriesResponse),
+	AppendRes(AppendEntriesResponse<NA>),
 	VoteReq(RequestVote<NA>),
-	VoteRes(RequestVoteResponse),
+	VoteRes(RequestVoteResponse<NA>),
 }
 
 impl<NA, ENT> NodeMessage<NA, ENT> {
@@ -49,6 +51,7 @@ impl<NA, ENT> NodeMessage<NA, ENT> {
 	}
 }
 
+#[derive(Debug)]
 pub enum ClientRequest<CA, REQ, ENT> {
 	Read(CA, REQ),
 	Apply(CA, ENT),

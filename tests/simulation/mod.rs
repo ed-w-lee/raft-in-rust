@@ -13,6 +13,9 @@ use rand_core::{RngCore, SeedableRng};
 // use chacha for reproducibility
 use rand_chacha::ChaChaRng;
 
+// mostly so we guarantee client messages come after all other events
+const CLIENT_OFFS: Duration = Duration::from_nanos(1000);
+
 pub type NodeId = u64;
 pub type ClientAddr = u64;
 pub type Entry = u64;
@@ -111,8 +114,6 @@ impl SimulationStorage {
 }
 
 impl<'a> Storage<'a, NodeId, Entry> for StorageHandle {
-	// TODO - probably have some way of persisting storage past death of a node
-	// So we can test what happens when a node crashes
 	fn get_data(self) -> PersistentData<'a, NodeId, Entry> {
 		let storage = self.entry.borrow();
 		let curr_term = storage.curr_term;
@@ -152,7 +153,7 @@ impl<'a> Storage<'a, NodeId, Entry> for StorageHandle {
 
 		let mut storage = self.entry.borrow_mut();
 		storage.entries.truncate((start - 1) as usize);
-		storage.entries.clone_from_slice(entries);
+		storage.entries.extend_from_slice(entries);
 	}
 }
 
@@ -188,6 +189,7 @@ pub struct Simulation<'a> {
 	heartbeat_timeout: Duration,
 	msg_delay: Duration,
 
+	last_event: Instant,
 	storage: SimulationStorage,
 	nodes: Vec<Option<Node<'a, NodeId, Entry, ClientAddr, (), ClientRes, SimStateMachine>>>,
 	messages: BinaryHeap<SimMessage>,
@@ -283,6 +285,7 @@ impl<'a> TryFrom<SimulationOpts> for Simulation<'a> {
 			heartbeat_timeout: my_h,
 			msg_delay: my_delay,
 
+			last_event: now,
 			storage,
 			nodes,
 			messages: BinaryHeap::new(),
@@ -349,6 +352,7 @@ impl<'a> Simulation<'a> {
 		validate_fn: &mut dyn FnMut(Vec<Option<NodeStatus<NodeId>>>),
 	) {
 		for _ in 0..num_events {
+			println!("new iteration -- # messages: {}", self.messages.len());
 			let (idx, t_next_tick) = self.get_next_tick_el();
 
 			let event = {
@@ -366,6 +370,7 @@ impl<'a> Simulation<'a> {
 			let (src, msgs_to_send, at) = {
 				match event {
 					Event::Tick(node_id, at) => {
+						self.last_event = at;
 						if let Some(node) = &mut self.nodes[node_id as usize] {
 							(node_id, node.tick(at), at)
 						} else {
@@ -374,6 +379,7 @@ impl<'a> Simulation<'a> {
 					}
 					Event::Message(packet) => {
 						let at = packet.at;
+						self.last_event = at;
 						let node_id = packet.dst;
 						if let Some(node) = &mut self.nodes[node_id as usize] {
 							(node_id, node.receive(&packet.msg, at), at)
@@ -396,18 +402,7 @@ impl<'a> Simulation<'a> {
 
 			// register all messages
 			for to_send in msgs_to_send {
-				match to_send {
-					Message::Node(dst, msg) => {
-						if !self.dropped_conns.contains(&(src, dst)) {
-							self.messages.push(SimMessage {
-								at: at + self.msg_delay,
-								dst: dst,
-								msg: msg,
-							});
-						}
-					}
-					Message::Client(_, _) => unimplemented!(),
-				}
+				self.register_msg(src, to_send, at)
 			}
 
 			let statuses = self
@@ -422,9 +417,40 @@ impl<'a> Simulation<'a> {
 		}
 	}
 
-	pub fn client_msg(&mut self, req: ClientRequest<ClientAddr, (), Entry>) {
+	pub fn client_msg(&mut self, to: NodeId, req: ClientRequest<ClientAddr, (), Entry>) {
 		// TODO - once client messages work
-		unimplemented!()
+		let at = self.last_event + CLIENT_OFFS;
+		if let Some(node) = &mut self.nodes[to as usize] {
+			let msgs_to_send = node.receive_client(req, at);
+			println!("after client, send: {}", msgs_to_send.len());
+			for to_send in msgs_to_send {
+				self.register_msg(to, to_send, at);
+			}
+		}
+	}
+
+	fn register_msg(
+		&mut self,
+		src: NodeId,
+		to_send: Message<NodeId, Entry, ClientAddr, u64>,
+		at: Instant,
+	) {
+		match to_send {
+			Message::Node(dst, msg) => {
+				if !self.dropped_conns.contains(&(src, dst)) {
+					self.messages.push(SimMessage {
+						at: at + self.msg_delay,
+						dst: dst,
+						msg: msg,
+					});
+				}
+			}
+			Message::Client(_, _) => {
+				// just don't do anything for right now
+				// TODO - allow clients to receive messages in simulation
+				()
+			}
+		}
 	}
 
 	fn get_next_tick_el(&self) -> (usize, Instant) {

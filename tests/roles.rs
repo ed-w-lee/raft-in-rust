@@ -1,8 +1,8 @@
 use rafted::{NodeRole, NodeStatus, Term};
 
 mod test_utils;
-use test_utils::simulation::{NodeId, Simulation, SimulationOpts};
-use test_utils::{partition, run_for_and_get_leader};
+pub use test_utils::simulation::{NodeId, Simulation, SimulationOpts};
+pub use test_utils::{partition, run_for_and_get_leader};
 
 use std::collections::HashMap;
 use std::convert::TryFrom;

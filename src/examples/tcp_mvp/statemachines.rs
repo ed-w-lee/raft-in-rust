@@ -14,6 +14,7 @@ impl StateMachine<(), u64, u64> for BasicStateMachine {
 	}
 
 	fn apply(&mut self, ent: &u64) -> u64 {
+		println!("apply {}", *ent);
 		if self.my_num > *ent {
 			0
 		} else {

@@ -141,7 +141,7 @@ where
 			heartbeat_timeout,
 			next_deadline: created_on + election_timeout,
 
-			last_known_leader: None,
+			last_known_leader: curr_state.voted_for,
 
 			hard_state: curr_state,
 			soft_state: VolatileData::new(),
@@ -162,8 +162,8 @@ where
 		msg: &NodeMessage<NA, ENT>,
 		at: Instant,
 	) -> Vec<Message<NA, ENT, CA, RES>> {
-		let mut updates = self._update_statemachine();
 		let mut to_ret = self._receive(msg, at);
+		let mut updates = self._update_statemachine();
 		// we just want to make sure the persistent data gets flushed before any messages get sent
 		self.hard_state.flush();
 		updates.append(&mut to_ret);
@@ -180,6 +180,7 @@ where
 		if msg.get_term() > self.hard_state.curr_term {
 			self.hard_state.curr_term = msg.get_term();
 			self.hard_state.voted_for = None;
+			// TODO - when transitioning from leader to follower, send message (either TryAgain or Redirect) and close connection
 			self.curr_type = NodeType::Follower;
 		}
 
@@ -243,7 +244,7 @@ where
 							lead.next_index[other_idx] -= 1;
 						}
 					}
-					match self.send_entries_to_node(self.other_addrs[other_idx].clone(), false) {
+					match self._send_entries_to_node(self.other_addrs[other_idx].clone(), false) {
 						Some(msg) => vec![msg],
 						None => vec![],
 					}
@@ -258,9 +259,9 @@ where
 		req: ClientRequest<CA, REQ, ENT>,
 		at: Instant,
 	) -> Vec<Message<NA, ENT, CA, RES>> {
+		let mut to_ret = self._receive_client(req, at);
 		let mut updates = self._update_statemachine();
 
-		let mut to_ret = self._receive_client(req, at);
 		self.hard_state.flush();
 
 		updates.append(&mut to_ret);
@@ -291,7 +292,13 @@ where
 
 			NodeType::Leader(_) => {
 				match req {
-					ClientRequest::Read(_client, _read_req) => unimplemented!(),
+					ClientRequest::Read(client, read_req) => {
+						// TODO make reads not return stale data
+						vec![Message::Client(
+							client,
+							ClientResponse::Response(self.statemachine.read(&read_req)),
+						)]
+					}
 					ClientRequest::Apply(client, new_entry) => {
 						// append to local log
 						let log_idx = self
@@ -308,8 +315,8 @@ where
 	}
 
 	pub fn tick(&mut self, at: Instant) -> Vec<Message<NA, ENT, CA, RES>> {
-		let mut updates = self._update_statemachine();
 		let mut to_ret = self._tick(at);
+		let mut updates = self._update_statemachine();
 		updates.append(&mut to_ret);
 		updates
 	}
@@ -367,16 +374,16 @@ where
 			NodeType::Leader(_) => self
 				.other_addrs
 				.iter()
-				.filter_map(|other| self.send_entries_to_node(other.clone(), empty))
+				.filter_map(|other| self._send_entries_to_node(other.clone(), empty))
 				.collect(),
 			_ => unreachable!(),
 		}
 	}
 
-	fn send_entries_to_node(&self, addr: NA, empty: bool) -> Option<Message<NA, ENT, CA, RES>> {
+	fn _send_entries_to_node(&self, addr: NA, empty: bool) -> Option<Message<NA, ENT, CA, RES>> {
 		match &self.curr_type {
 			NodeType::Leader(leader_data) => {
-				let other_idx: usize = self.get_idx_of(addr);
+				let other_idx: usize = self._get_idx_of(addr);
 				let next_index = leader_data.next_index[other_idx];
 				if !empty && self.hard_state.last_entry() < next_index {
 					None
@@ -390,7 +397,7 @@ where
 							prev_log_index: next_index - 1,
 							prev_log_term: self.hard_state.get_term(next_index - 1).unwrap(),
 							entries: {
-								if !empty {
+								if self.hard_state.last_entry() >= next_index {
 									Vec::from(self.hard_state.get_entries(next_index))
 								} else {
 									vec![]
@@ -404,7 +411,7 @@ where
 		}
 	}
 
-	fn get_idx_of(&self, addr: NA) -> usize {
+	fn _get_idx_of(&self, addr: NA) -> usize {
 		self.other_addrs.iter().position(|&a| a == addr).unwrap()
 	}
 
@@ -464,6 +471,7 @@ where
 				.is_up2date(req.last_log_index, req.last_log_term)
 		{
 			self.hard_state.voted_for = Some(req.candidate_id);
+			self.last_known_leader = Some(req.candidate_id);
 			vote_granted = true;
 		}
 
@@ -495,6 +503,7 @@ where
 
 		self.hard_state.curr_term += 1;
 		self.hard_state.voted_for = Some(self.my_id);
+		self.last_known_leader = Some(self.my_id);
 		self.next_deadline = at + self.election_timeout;
 
 		let my_last_idx = self.hard_state.last_entry();
@@ -521,12 +530,13 @@ where
 		while self.soft_state.commit_index > self.soft_state.last_applied {
 			self.soft_state.last_applied += 1;
 			let idx = self.soft_state.last_applied;
+			let res = self.statemachine.apply(&self.hard_state.get_entry(idx).1);
 			match self.curr_type {
 				NodeType::Leader(_) => {
 					if self.client_addrs.contains_key(&idx) {
 						to_ret.push(Message::Client(
 							self.client_addrs[&idx].clone(),
-							ClientResponse::Response(self.statemachine.apply(&self.hard_state.get_entry(idx).1)),
+							ClientResponse::Response(res),
 						));
 						self.client_addrs.remove_entry(&idx);
 					}

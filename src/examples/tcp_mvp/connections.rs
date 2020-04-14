@@ -5,7 +5,7 @@ use crate::LISTEN_PORT;
 
 use rafted::message::{ClientResponse, Message, NodeMessage};
 
-use libc::{self, POLLIN};
+use libc::{self, POLLERR, POLLHUP, POLLIN, POLLNVAL};
 use net2::TcpBuilder;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -43,17 +43,18 @@ pub struct ConnUpdates {
 	client_updated: bool,
 }
 
-/**
- * Maintains information on how to translate between sockets and messages.
- * It also maintains a distinction between clients and other raft nodes.
- *
- * --- Notes ---
- * Admittedly, many places for optimization, but I'll ignore that for in an attempt
- * to get the logic done.
- * May be interesting to add in FSM-like behavior to prevent getting messages before
- * polling, only being able to poll once fds are regenerated, etc. I tried doing that
- * but it got too complicated imo.
- */
+///
+/// Maintains information on how to translate between sockets and messages.
+/// It also maintains a distinction between clients and other raft nodes.
+///
+/// --- Notes ---
+///
+/// Admittedly, many places for optimization, but I'll ignore that for in an attempt
+/// to get the logic done.
+/// May be interesting to add in FSM-like behavior to prevent getting messages before
+/// polling, only being able to poll once fds are regenerated, etc. I tried doing that
+/// but it got too complicated imo.
+///
 pub struct Connections<M, E, RES> {
 	my_addr: IpAddr,
 	next_port: u16,
@@ -206,6 +207,42 @@ where
 		msg_map
 	}
 
+	pub fn clean_err_fds(&mut self) {
+		let pfds_to_clean: Vec<&libc::pollfd> = self.pollfds[1..self.curr_len]
+			.iter()
+			.map(|pfd| unsafe { &*pfd.as_ptr() })
+			.filter(|pfd| pfd.revents & (POLLHUP | POLLNVAL | POLLERR) != 0)
+			.collect();
+
+		let to_print: Vec<RawFd> = pfds_to_clean.iter().map(|pfd| pfd.fd).collect();
+		println!("{:?}", to_print);
+		for pfd in pfds_to_clean {
+			if let Some(addr) = self.node_fds.get(&pfd.fd) {
+				let stream = self
+					.node_streams
+					.get_mut(addr)
+					.expect("unexpected key for node_streams");
+				// disconnect
+				let addr_to_rem = addr.clone();
+				self.node_fds.remove_entry(&stream.as_raw_fd());
+				self.node_streams.remove_entry(&addr_to_rem);
+				self.updates.node_updated = true;
+			} else if let Some((_, addr)) = self.client_fds.get(&pfd.fd) {
+				let stream = self
+					.client_streams
+					.get_mut(addr)
+					.expect("unexpected key for client_streams");
+				// disconnect
+				let addr_to_rem = addr.clone();
+				self.client_fds.remove_entry(&stream.as_raw_fd());
+				self.client_streams.remove_entry(&addr_to_rem);
+				self.updates.client_updated = true;
+			} else {
+				panic!("found pfd that wasn't registered")
+			}
+		}
+	}
+
 	pub fn get_client_msgs(&mut self) -> HashMap<ClientAddr, Vec<M>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.node_end..self.curr_len]
 			.iter()
@@ -266,17 +303,16 @@ where
 		match mesg {
 			Message::Node(addr, msg) => self.send_node(&NodeAddr { addr }, vec![msg]),
 			Message::Client(addr, res) => match res {
-				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string()),
+				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string(), false),
 				ClientResponse::Redirect(a) => {
-					// TODO close connection
-					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()))
+					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()), true)
 				}
 				ClientResponse::TryAgain => {
-					// TODO close connection
 					self.send_client(
 						&addr,
 						"no known leader. try again another node another time",
-					)
+						true,
+					);
 				}
 			},
 		}
@@ -345,14 +381,14 @@ where
 		}
 	}
 
-	fn send_client(&mut self, addr: &ClientAddr, msg: &str) {
+	fn send_client(&mut self, addr: &ClientAddr, msg: &str, close: bool) {
 		match self.client_streams.get_mut(addr) {
 			Some(stream) => {
 				match stream.write_all(msg.as_bytes()) {
 					Ok(_) => {}
 					Err(_) => {}
 				};
-				if !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
+				if close || !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
 					self.client_fds.remove_entry(&stream.as_raw_fd());
 					self.client_streams.remove_entry(addr);
 

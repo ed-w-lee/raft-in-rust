@@ -141,14 +141,16 @@ where
 			Err(e) => panic!("some io error: {}", e),
 		};
 
+		let mut old_buflen = 0;
 		let newbuf = match self.buffers.remove(key) {
 			Some(mut b) => {
+				old_buflen = b.len();
 				b.append(&mut buf);
 				b
 			}
 			None => buf,
 		};
-		println!("current buf len: {}", newbuf.len());
+		println!("buf len: {} -> {}", old_buflen, newbuf.len());
 
 		let mut msgs: Vec<NodeMessage<A, E>> = vec![];
 		let mut curr_ind = 0;

@@ -17,8 +17,9 @@ use std::io::Error;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 
-const ELECTION_TIMEOUT: Duration = Duration::from_millis(5000);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2000);
+const ELECTION_TIMEOUT: Duration = Duration::from_millis(10000);
+const TIMEOUT_OFFS: Duration = Duration::from_millis(500);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(4000);
 pub const LISTEN_PORT: u16 = 4242;
 
 fn main() {
@@ -37,6 +38,9 @@ fn main() {
 	println!("running on {:?}", listener.local_addr().unwrap());
 
 	let my_addr = listener.local_addr().unwrap().ip();
+	let my_addr_idx = ips.iter().position(|a| a.clone() == my_addr).unwrap();
+	let my_timeout = ELECTION_TIMEOUT + (TIMEOUT_OFFS * (my_addr_idx as u32));
+
 	let other_ips: Vec<IpAddr> = ips
 		.iter()
 		.map(|addr| addr.clone())
@@ -48,7 +52,7 @@ fn main() {
 		my_addr,
 		other_ips,
 		Instant::now(),
-		ELECTION_TIMEOUT,
+		my_timeout,
 		HEARTBEAT_TIMEOUT,
 		storage.get_data(),
 	);
@@ -120,7 +124,13 @@ fn main() {
 					let client_msgs = conn_manager.get_client_msgs();
 					client_msgs.into_iter().for_each(|(k, v)| {
 						v.into_iter().for_each(|val| {
-							let client_req = ClientRequest::Apply(k, val);
+							let client_req = {
+								if val == 0 {
+									ClientRequest::Read(k, ())
+								} else {
+									ClientRequest::Apply(k, val)
+								}
+							};
 							node
 								.receive_client(client_req, Instant::now())
 								.into_iter()
@@ -130,6 +140,7 @@ fn main() {
 						})
 					});
 
+					conn_manager.clean_err_fds();
 					conn_manager.regenerate_pollfds();
 				}
 			}

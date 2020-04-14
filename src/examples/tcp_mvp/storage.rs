@@ -121,6 +121,7 @@ where
 			Some(tup) => {
 				let (curr_term, voted_for, first_index, first_term, entries) = tup;
 				println!("file storage read correctly, curr_term: {}", curr_term);
+				println!("past entries: {:?}", entries);
 				PersistentData::from_existing(
 					Box::new(self),
 					curr_term,

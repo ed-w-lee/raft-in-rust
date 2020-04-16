@@ -177,10 +177,20 @@ where
 	) -> Vec<Message<NA, ENT, CA, RES>> {
 		println!("received at {:?} for {:?} -- message: {:?}", at, self, msg);
 
+		// TODO - maybe extract this into its own fn and add it to the wrapper
+		let mut to_ret = vec![];
 		if msg.get_term() > self.hard_state.curr_term {
 			self.hard_state.curr_term = msg.get_term();
 			self.hard_state.voted_for = None;
-			// TODO - when transitioning from leader to follower, send message (either TryAgain or Redirect) and close connection
+			if let NodeType::Leader(_) = &self.curr_type {
+				let mut client_updates: Vec<Message<NA, ENT, CA, RES>> = self
+					.client_addrs
+					.values()
+					.map(|addr| Message::Client(addr.clone(), ClientResponse::TryAgain))
+					.collect();
+
+				to_ret.append(&mut client_updates);
+			}
 			self.curr_type = NodeType::Follower;
 		}
 
@@ -191,10 +201,14 @@ where
 						// should be current leader
 						self.next_deadline = at + self.election_timeout;
 					}
-					vec![self._handle_append_entries(req)]
+					to_ret.append(&mut vec![self._handle_append_entries(req)]);
+					to_ret
 				}
-				NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req)],
-				_ => vec![],
+				NodeMessage::VoteReq(req) => {
+					to_ret.append(&mut vec![self._handle_request_vote(req)]);
+					to_ret
+				}
+				_ => to_ret,
 			},
 			NodeType::Candidate(cand) => {
 				match msg {

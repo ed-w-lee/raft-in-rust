@@ -4,10 +4,10 @@ use crate::message::{
 };
 use crate::persistent::PersistentData;
 use crate::statemachine::StateMachine;
-use crate::types::{LogIndex, Term};
+use crate::types::{LogIndex, ReaderIndex, Term};
 
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::iter::FromIterator;
@@ -19,17 +19,21 @@ struct VolatileData {
 	last_applied: LogIndex,
 }
 
-struct LeaderData {
+struct LeaderData<CA, REQ> {
 	next_index: Vec<LogIndex>,
 	match_index: Vec<LogIndex>,
+
+	reader_next: ReaderIndex,
+	reader_index: Vec<ReaderIndex>,
+	reader_queue: VecDeque<(ReaderIndex, CA, REQ)>,
 }
 
 struct CandidateData<NA> {
 	votes: HashSet<NA>,
 }
 
-enum NodeType<NA> {
-	Leader(LeaderData),
+enum NodeType<NA, CA, REQ> {
+	Leader(LeaderData<CA, REQ>),
 	Candidate(CandidateData<NA>),
 	Follower,
 }
@@ -58,7 +62,7 @@ pub struct NodeStatus<A> {
 /// RES - client response
 /// SM - state machine
 pub struct Node<'a, NA, ENT, CA, REQ, RES, SM> {
-	curr_type: NodeType<NA>,
+	curr_type: NodeType<NA, CA, REQ>,
 	my_id: NA,
 	other_addrs: Vec<NA>,
 
@@ -106,11 +110,15 @@ impl VolatileData {
 	}
 }
 
-impl LeaderData {
+impl<CA, REQ> LeaderData<CA, REQ> {
 	fn new(num_others: usize, last_log_index: LogIndex) -> Self {
 		LeaderData {
 			next_index: vec![last_log_index + 1; num_others],
 			match_index: vec![0; num_others],
+
+			reader_next: 0,
+			reader_index: vec![0; num_others],
+			reader_queue: VecDeque::new(),
 		}
 	}
 }
@@ -164,9 +172,11 @@ where
 	) -> Vec<Message<NA, ENT, CA, RES>> {
 		let mut to_ret = self._receive(msg, at);
 		let mut updates = self._update_statemachine();
+		let mut client_updates = self._respond_to_reads();
 		// we just want to make sure the persistent data gets flushed before any messages get sent
 		self.hard_state.flush();
 		updates.append(&mut to_ret);
+		updates.append(&mut client_updates);
 		updates
 	}
 
@@ -251,7 +261,16 @@ where
 							// 4 other_addrs requires 2
 							// 5 other_addrs requires 3
 							let next_commit = find_commit[(self.other_addrs.len() + 1) / 2];
-							self.soft_state.commit_index = next_commit;
+							if self.hard_state.get_term(next_commit).unwrap() == self.hard_state.curr_term {
+								// only update our commit index when we've written something as leader
+								self.soft_state.commit_index = next_commit;
+								if self.hard_state.curr_term == res.term {
+									// make sure response is from our term so no confusions about what reader index refers to
+									if lead.reader_index[other_idx] < res.reader_idx {
+										lead.reader_index[other_idx] = res.reader_idx;
+									}
+								}
+							}
 						}
 						None => {
 							// get idx
@@ -288,7 +307,7 @@ where
 		at: Instant,
 	) -> Vec<Message<NA, ENT, CA, RES>> {
 		println!("received at {:?} for {:?} -- message: {:?}", at, self, req);
-		match &self.curr_type {
+		match &mut self.curr_type {
 			NodeType::Candidate(_) => match self.last_known_leader {
 				Some(node) => vec![Message::Client(
 					req.get_addr(),
@@ -304,20 +323,35 @@ where
 				None => vec![Message::Client(req.get_addr(), ClientResponse::TryAgain)],
 			},
 
-			NodeType::Leader(_) => {
+			NodeType::Leader(leader_data) => {
 				match req {
 					ClientRequest::Read(client, read_req) => {
 						// TODO make reads not return stale data
-						vec![Message::Client(
-							client,
-							ClientResponse::Response(self.statemachine.read(&read_req)),
-						)]
+						// We can probably track read requests through some unique supplied ID (based on etcd's impl, keep a queue)
+						//    --> Need to modify ClientReq, AppendEntries/Response (we could add a Heartbeat msg)
+						if self
+							.hard_state
+							.get_term(self.soft_state.commit_index)
+							.unwrap() < self.hard_state.curr_term
+						{
+							// If something has not yet been committed from leader's term, reject
+							vec![Message::Client(client, ClientResponse::TryAgain)]
+						} else {
+							// store request in queue, we need to wait until this request is ACK'd (needs to be same term)
+							leader_data.reader_next += 1;
+							let my_idx = leader_data.reader_next;
+							leader_data
+								.reader_queue
+								.push_back((my_idx, client, read_req));
+
+							vec![]
+						}
 					}
 					ClientRequest::Apply(client, new_entry) => {
 						// append to local log
 						let log_idx = self
 							.hard_state
-							.append_entry((self.hard_state.curr_term, new_entry));
+							.append_entry((self.hard_state.curr_term, Some(new_entry)));
 
 						// add client addr to map in case we should return something
 						self.client_addrs.insert(log_idx, client);
@@ -417,6 +451,7 @@ where
 									vec![]
 								}
 							},
+							reader_idx: leader_data.reader_next,
 						}),
 					))
 				}
@@ -441,6 +476,7 @@ where
 					term: self.hard_state.curr_term,
 					from: self.my_id,
 					success: None,
+					reader_idx: req.reader_idx,
 				}),
 			)
 		} else {
@@ -469,6 +505,7 @@ where
 					term: self.hard_state.curr_term,
 					from: self.my_id,
 					success: Some(self.hard_state.last_entry()),
+					reader_idx: req.reader_idx,
 				}),
 			)
 		}
@@ -506,6 +543,10 @@ where
 			self.other_addrs.len(),
 			self.hard_state.last_entry(),
 		));
+		// we're elected. commit a no-op to check what's been committed
+		self
+			.hard_state
+			.append_entry((self.hard_state.curr_term, None));
 
 		self._send_entries(true)
 	}
@@ -539,23 +580,54 @@ where
 			.collect()
 	}
 
+	fn _respond_to_reads(&mut self) -> Vec<Message<NA, ENT, CA, RES>> {
+		match &mut self.curr_type {
+			NodeType::Leader(lead) => {
+				let mut find_readable = lead.reader_index.clone();
+				find_readable.sort();
+				let next_readable = find_readable[(self.other_addrs.len() + 1) / 2];
+				let mut to_ret = vec![];
+				loop {
+					match lead.reader_queue.front() {
+						Some(tup) => {
+							if tup.0 > next_readable {
+								break;
+							}
+							to_ret.push(Message::Client(
+								tup.1.clone(),
+								ClientResponse::Response(self.statemachine.read(&tup.2)),
+							));
+						}
+						None => break,
+					}
+					lead.reader_queue.pop_front();
+				}
+
+				to_ret
+			}
+			_ => vec![],
+		}
+	}
+
 	fn _update_statemachine(&mut self) -> Vec<Message<NA, ENT, CA, RES>> {
 		let mut to_ret = vec![];
 		while self.soft_state.commit_index > self.soft_state.last_applied {
 			self.soft_state.last_applied += 1;
 			let idx = self.soft_state.last_applied;
-			let res = self.statemachine.apply(&self.hard_state.get_entry(idx).1);
-			match self.curr_type {
-				NodeType::Leader(_) => {
-					if self.client_addrs.contains_key(&idx) {
-						to_ret.push(Message::Client(
-							self.client_addrs[&idx].clone(),
-							ClientResponse::Response(res),
-						));
-						self.client_addrs.remove_entry(&idx);
+			if let Some(entry) = &self.hard_state.get_entry(idx).1 {
+				let res = self.statemachine.apply(entry);
+				match self.curr_type {
+					NodeType::Leader(_) => {
+						if self.client_addrs.contains_key(&idx) {
+							to_ret.push(Message::Client(
+								self.client_addrs[&idx].clone(),
+								ClientResponse::Response(res),
+							));
+							self.client_addrs.remove_entry(&idx);
+						}
 					}
+					_ => {}
 				}
-				_ => {}
 			}
 		}
 		to_ret

@@ -1,4 +1,4 @@
-use crate::types::{LogIndex, Term};
+use crate::types::{LogIndex, ReaderIndex, Term};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct AppendEntries<NA, ENT> {
@@ -7,7 +7,8 @@ pub struct AppendEntries<NA, ENT> {
 	pub leader_commit: LogIndex,
 	pub prev_log_index: LogIndex,
 	pub prev_log_term: Term,
-	pub entries: Vec<(Term, ENT)>,
+	pub reader_idx: ReaderIndex,
+	pub entries: Vec<(Term, Option<ENT>)>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -15,6 +16,7 @@ pub struct AppendEntriesResponse<NA> {
 	pub term: Term,
 	pub from: NA,
 	pub success: Option<LogIndex>,
+	pub reader_idx: ReaderIndex,
 }
 
 #[derive(Debug, PartialEq, Clone)]

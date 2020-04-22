@@ -13,7 +13,7 @@ pub struct PersistentData<'a, A, E> {
 	first_index: LogIndex,
 	first_term: Term,
 	dirty_begin: Option<LogIndex>,
-	entries: Vec<(Term, E)>,
+	entries: Vec<(Term, Option<E>)>,
 }
 
 pub trait Storage<'a, A, E>: Debug {
@@ -29,7 +29,7 @@ pub trait Storage<'a, A, E>: Debug {
 
 	/// Clear the storage of all log entries whose index >= start
 	/// Then append entries in their place
-	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, E)]);
+	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, Option<E>)]);
 }
 
 impl<'a, A, E> PersistentData<'a, A, E>
@@ -54,7 +54,7 @@ where
 		voted_for: Option<A>,
 		first_index: LogIndex,
 		first_term: Term,
-		entries: Vec<(Term, E)>,
+		entries: Vec<(Term, Option<E>)>,
 	) -> Self {
 		Self {
 			storage,
@@ -91,7 +91,7 @@ where
 	}
 
 	/* Log related stuff */
-	pub fn get_entry(&self, index: LogIndex) -> &(Term, E) {
+	pub fn get_entry(&self, index: LogIndex) -> &(Term, Option<E>) {
 		if index <= self.first_index {
 			panic!("bad index query");
 		} else {
@@ -99,7 +99,7 @@ where
 		}
 	}
 
-	pub fn get_entries(&self, start: LogIndex) -> &[(Term, E)] {
+	pub fn get_entries(&self, start: LogIndex) -> &[(Term, Option<E>)] {
 		if start < self.first_index {
 			panic!("bad index query");
 		} else if start == self.first_index {
@@ -110,12 +110,12 @@ where
 		}
 	}
 
-	pub fn append_entry(&mut self, new_entry: (Term, E)) -> LogIndex {
+	pub fn append_entry(&mut self, new_entry: (Term, Option<E>)) -> LogIndex {
 		self.append_entries(&mut vec![new_entry]);
 		self.last_entry()
 	}
 
-	pub fn append_entries(&mut self, new_entries: &[(Term, E)]) {
+	pub fn append_entries(&mut self, new_entries: &[(Term, Option<E>)]) {
 		if !new_entries.is_empty() {
 			self.dirty_begin = Some(match self.dirty_begin {
 				Some(db) => min(db, self.last_entry() + 1),
@@ -125,14 +125,18 @@ where
 		}
 	}
 
-	pub fn update_entries(&mut self, start: LogIndex, new_entries: &[(Term, E)]) -> Result<(), ()> {
+	pub fn update_entries(
+		&mut self,
+		start: LogIndex,
+		new_entries: &[(Term, Option<E>)],
+	) -> Result<(), ()> {
 		if start > self.last_entry() + 1 {
 			Err(())
 		} else if start == self.last_entry() + 1 {
 			self.append_entries(new_entries);
 			Ok(())
 		} else {
-			let remaining = start - self.first_index;
+			let remaining = start - self.first_index - 1;
 			self.entries.truncate(remaining as usize);
 			self.dirty_begin = Some(self.last_entry() + 1);
 			self.append_entries(new_entries);

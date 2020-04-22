@@ -72,7 +72,7 @@ struct StorageEntry {
 	pub voted_for: Option<NodeId>,
 	pub first_index: LogIndex,
 	pub first_term: Term,
-	pub entries: Vec<(Term, Entry)>,
+	pub entries: Vec<(Term, Option<Entry>)>,
 }
 
 struct SimulationStorage {
@@ -146,7 +146,7 @@ impl<'a> Storage<'a, NodeId, Entry> for StorageHandle {
 		storage.first_term = first_term;
 	}
 
-	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, Entry)]) {
+	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, Option<Entry>)]) {
 		if start == 0 {
 			assert!(entries.is_empty());
 		}

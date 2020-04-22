@@ -43,7 +43,7 @@ where
 	A: Serialize + 'a,
 	E: Serialize + 'a,
 {
-	fn _get_data(&mut self) -> Option<(Term, Option<A>, LogIndex, Term, Vec<(Term, E)>)> {
+	fn _get_data(&mut self) -> Option<(Term, Option<A>, LogIndex, Term, Vec<(Term, Option<E>)>)> {
 		// --- read state ---
 		self
 			.state_file
@@ -101,7 +101,7 @@ where
 			let (to_shift, my_term) = tup;
 			slice = &slice[to_shift..];
 
-			let tup = E::from_bytes(slice).ok()?;
+			let tup = Option::<E>::from_bytes(slice).ok()?;
 			let (to_shift, my_entry) = tup;
 			slice = &slice[to_shift..];
 			log.push((*my_term, *my_entry));
@@ -166,7 +166,7 @@ where
 		println!("file storage updated with term: {}", term);
 	}
 
-	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, E)]) {
+	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, Option<E>)]) {
 		self
 			.entries_file
 			.seek(SeekFrom::Start(0))

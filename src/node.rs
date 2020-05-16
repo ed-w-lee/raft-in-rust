@@ -215,7 +215,7 @@ where
 					to_ret
 				}
 				NodeMessage::VoteReq(req) => {
-					to_ret.append(&mut vec![self._handle_request_vote(req)]);
+					to_ret.append(&mut vec![self._handle_request_vote(req, at)]);
 					to_ret
 				}
 				_ => to_ret,
@@ -227,7 +227,7 @@ where
 						vec![self._handle_append_entries(req)]
 					}
 					// we know this is going to reject, but whatever
-					NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req)],
+					NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req, at)],
 					NodeMessage::VoteRes(res) => {
 						if res.vote_granted {
 							cand.votes.insert(res.from);
@@ -326,15 +326,13 @@ where
 			NodeType::Leader(leader_data) => {
 				match req {
 					ClientRequest::Read(client, read_req) => {
-						// TODO make reads not return stale data
-						// We can probably track read requests through some unique supplied ID (based on etcd's impl, keep a queue)
-						//    --> Need to modify ClientReq, AppendEntries/Response (we could add a Heartbeat msg)
 						if self
 							.hard_state
 							.get_term(self.soft_state.commit_index)
 							.unwrap() < self.hard_state.curr_term
 						{
 							// If something has not yet been committed from leader's term, reject
+							// TODO we can still register the read request, and only respond once we get a commit in
 							vec![Message::Client(client, ClientResponse::TryAgain)]
 						} else {
 							// store request in queue, we need to wait until this request is ACK'd (needs to be same term)
@@ -511,7 +509,11 @@ where
 		}
 	}
 
-	fn _handle_request_vote(&mut self, req: &RequestVote<NA>) -> Message<NA, ENT, CA, RES> {
+	fn _handle_request_vote(
+		&mut self,
+		req: &RequestVote<NA>,
+		at: Instant,
+	) -> Message<NA, ENT, CA, RES> {
 		let mut vote_granted = false;
 
 		if req.term >= self.hard_state.curr_term
@@ -524,6 +526,7 @@ where
 			self.hard_state.voted_for = Some(req.candidate_id);
 			self.last_known_leader = Some(req.candidate_id);
 			vote_granted = true;
+			self.next_deadline = at + self.election_timeout;
 		}
 
 		Message::Node(

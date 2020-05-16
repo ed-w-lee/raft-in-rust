@@ -2,7 +2,7 @@ use crate::serialize::Serialize;
 use rafted::{LogIndex, PersistentData, Storage, Term};
 
 use std::fmt::{Debug, Display};
-use std::fs::{File, OpenOptions};
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 
@@ -19,18 +19,21 @@ where
 	A: Display,
 {
 	pub fn new(addr: A) -> Self {
+		let my_dir = format!("/tmp/rafted_tcpmvp_{}", addr);
+		create_dir_all(&my_dir).expect("failed to create required directory");
+
 		Self {
 			state_file: OpenOptions::new()
 				.read(true)
 				.write(true)
 				.create(true)
-				.open(format!("/tmp/rafted_tcpmvp_state_{}", addr))
+				.open(format!("{}/state", my_dir))
 				.unwrap(),
 			entries_file: OpenOptions::new()
 				.read(true)
 				.write(true)
 				.create(true)
-				.open(format!("/tmp/rafted_tcpmvp_entries_{}", addr))
+				.open(format!("{}/entries", my_dir))
 				.unwrap(),
 			_addr: PhantomData,
 			_entry: PhantomData,
@@ -163,6 +166,10 @@ where
 			.state_file
 			.write_all(&buf)
 			.expect("couldn't update state");
+		self
+			.state_file
+			.sync_data()
+			.expect("couldn't sync state_file successfully");
 		println!("file storage updated with term: {}", term);
 	}
 
@@ -216,7 +223,7 @@ where
 				let (to_shift, _) = tup;
 				slice = &slice[to_shift..];
 
-				let tup = E::from_bytes(slice).expect("fuck");
+				let tup = Option::<E>::from_bytes(slice).expect("fuck");
 				let (to_shift, _) = tup;
 				slice = &slice[to_shift..];
 			}
@@ -251,5 +258,10 @@ where
 			.entries_file
 			.write_all(&(start + (entries.len() as u64) - 1).to_bytes())
 			.expect("no write rip");
+
+		self
+			.entries_file
+			.sync_data()
+			.expect("Couldn't sync successfully");
 	}
 }

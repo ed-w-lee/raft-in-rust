@@ -5,6 +5,7 @@ use crate::LISTEN_PORT;
 
 use rafted::message::{ClientResponse, Message, NodeMessage};
 
+use fnv::FnvHashMap;
 use libc::{self, POLLERR, POLLHUP, POLLIN, POLLNVAL};
 use net2::TcpBuilder;
 use std::collections::HashMap;
@@ -62,10 +63,10 @@ pub struct Connections<M, E, RES> {
 	node_end: usize,
 	curr_len: usize,
 	node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
-	node_fds: HashMap<RawFd, NodeAddr>,
+	node_fds: FnvHashMap<RawFd, NodeAddr>,
 	node_streams: HashMap<NodeAddr, TcpStream>,
 	client_parse: Box<dyn ClientParse<TcpStream, M>>,
-	client_fds: HashMap<RawFd, (bool, ClientAddr)>,
+	client_fds: FnvHashMap<RawFd, (bool, ClientAddr)>,
 	client_streams: HashMap<ClientAddr, TcpStream>,
 	updates: ConnUpdates,
 	_response: PhantomData<RES>,
@@ -94,10 +95,10 @@ where
 			node_end: 1,
 			curr_len: 1,
 			node_parse,
-			node_fds: HashMap::new(),
+			node_fds: FnvHashMap::default(),
 			node_streams: HashMap::new(),
 			client_parse,
-			client_fds: HashMap::new(),
+			client_fds: FnvHashMap::default(),
 			client_streams: HashMap::new(),
 			updates: ConnUpdates {
 				node_updated: false,
@@ -109,9 +110,10 @@ where
 
 	pub fn poll(&mut self, timeout: i32) -> i32 {
 		println!(
-			"poll status: \n\tlast pollfd {{ fd: {}, events: {} }}\n\tnode fds: {}, client fds: {}",
+			"poll status: \n\tlast pollfd {{ fd: {}, events: {} }}\n\tcurr_len: {}, node fds: {}, client fds: {}",
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events,
+			self.curr_len,
 			self.node_fds.len(),
 			self.client_fds.len()
 		);
@@ -123,24 +125,22 @@ where
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		// shift over any client pollfds
-		if self.node_end < self.curr_len {
-			unsafe {
-				copy(
-					self.pollfds[self.node_end].as_ptr(),
-					self.pollfds[self.node_end + 1].as_mut_ptr(),
-					self.curr_len - self.node_end,
-				)
+		// prefer existing connections to this new one
+		if self.node_streams.contains_key(&addr) {
+			if self.my_addr < addr.addr {
+				return;
+			} else {
+				let old_stream = self
+					.node_streams
+					.remove_entry(&addr)
+					.expect("node_streams doesn't contain stream to remove");
+				self.node_fds.remove_entry(&old_stream.1.as_raw_fd());
 			}
 		}
 
-		// insert node pollfd
-		*(&mut self.pollfds[self.node_end]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
-		self.node_end += 1;
-		self.curr_len += 1;
-
 		self.node_fds.insert(stream.as_raw_fd(), addr);
 		self.node_streams.insert(addr, stream);
+		self.updates.node_updated = true;
 	}
 
 	pub fn register_client(&mut self, addr: ClientAddr, stream: TcpStream) {
@@ -148,26 +148,27 @@ where
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		*(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
-		self.curr_len += 1;
-		println!(
-			"registered client: pollfd {{ fd: {}, events: {} }}",
-			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
-			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
-		);
+		// *(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
+		// self.curr_len += 1;
+		// println!(
+		// 	"registered client: pollfd {{ fd: {}, events: {} }}",
+		// 	unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
+		// 	unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
+		// );
 
 		self.client_fds.insert(stream.as_raw_fd(), (true, addr));
 		self.client_streams.insert(addr, stream);
+		self.updates.client_updated = true;
 	}
 
-	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
+	pub fn get_node_msgs(&mut self) -> FnvHashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		let mut msg_map: HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = HashMap::new();
+		let mut msg_map: FnvHashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = FnvHashMap::default();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
 			let addr = self
@@ -238,19 +239,20 @@ where
 				self.client_streams.remove_entry(&addr_to_rem);
 				self.updates.client_updated = true;
 			} else {
-				panic!("found pfd that wasn't registered")
+				// this is likely a pfd that got cleaned up through an unsuccessful read/write
+				println!("WARN - found pfd that wasn't registered")
 			}
 		}
 	}
 
-	pub fn get_client_msgs(&mut self) -> HashMap<ClientAddr, Vec<M>> {
+	pub fn get_client_msgs(&mut self) -> FnvHashMap<ClientAddr, Vec<M>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.node_end..self.curr_len]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
+		let mut msg_map: FnvHashMap<ClientAddr, Vec<M>> = FnvHashMap::default();
 		let mut client_updated = false;
 		for pfd in pfds_to_read {
 			let tup = self
@@ -351,8 +353,9 @@ where
 		if self.node_streams.get_mut(addr).is_none() {
 			let build = TcpBuilder::new_v4().unwrap();
 			loop {
-				match build.bind(SocketAddr::new(self.my_addr, self.next_port)) {
+				match build.bind(SocketAddr::new(self.my_addr, 0)) {
 					Ok(b) => {
+						self.next_port += 1;
 						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, LISTEN_PORT)) {
 							stream
 								.set_nonblocking(true)

@@ -12,14 +12,15 @@ use storage::FileStorage;
 use rafted::message::ClientRequest;
 use rafted::{Node, Storage};
 
+use std::env;
 use std::io;
 use std::io::Error;
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, TcpListener};
 use std::time::{Duration, Instant};
 
-const ELECTION_TIMEOUT: Duration = Duration::from_millis(10000);
-const TIMEOUT_OFFS: Duration = Duration::from_millis(500);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(4000);
+const ELECTION_TIMEOUT: Duration = Duration::from_millis(5000);
+const TIMEOUT_OFFS: Duration = Duration::from_millis(1000);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const LISTEN_PORT: u16 = 4242;
 
 fn main() {
@@ -30,16 +31,13 @@ fn main() {
 		// "127.0.0.41".parse().unwrap(),
 		// "127.0.0.51".parse().unwrap(),
 	];
-	let bind_addrs: Vec<SocketAddr> = ips
-		.iter()
-		.map(|addr| SocketAddr::new(addr.clone(), LISTEN_PORT))
-		.collect();
-	let listener = TcpListener::bind(&bind_addrs[..]).unwrap();
+	let args: Vec<String> = env::args().collect();
+	let my_idx: usize = args[1].parse().unwrap();
+	let listener = TcpListener::bind((ips[my_idx], LISTEN_PORT)).unwrap();
 	println!("running on {:?}", listener.local_addr().unwrap());
 
 	let my_addr = listener.local_addr().unwrap().ip();
-	let my_addr_idx = ips.iter().position(|a| a.clone() == my_addr).unwrap();
-	let my_timeout = ELECTION_TIMEOUT + (TIMEOUT_OFFS * (my_addr_idx as u32));
+	let my_timeout = ELECTION_TIMEOUT + (TIMEOUT_OFFS * (my_idx as u32));
 
 	let other_ips: Vec<IpAddr> = ips
 		.iter()
@@ -73,6 +71,7 @@ fn main() {
 		{
 			Some(timeout) => {
 				println!("time til election timeout: {:?}", timeout);
+				conn_manager.regenerate_pollfds();
 				let result = conn_manager.poll(timeout.as_millis() as i32 + 1);
 				println!("result: {}", result);
 				if result < 0 {
@@ -86,25 +85,6 @@ fn main() {
 				} else {
 					// TODO: we can probably use result to reduce the amount of time spent looking for
 					// readable sockets, but probably too little to matter
-
-					// listener
-					match listener.accept() {
-						Ok((stream, addr)) => {
-							stream
-								.set_nonblocking(true)
-								.expect("stream.set_nonblocking failed");
-							let ip = addr.ip();
-							if node.is_other_node(&ip) {
-								conn_manager.register_node(NodeAddr::new(ip), stream);
-							} else {
-								conn_manager.register_client(ClientAddr::new(addr), stream);
-							}
-						}
-						Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-							println!("no new connections!");
-						}
-						Err(e) => panic!("encountered IO error: {}", e),
-					}
 
 					// handle messages from nodes first
 					let node_msgs = conn_manager.get_node_msgs();
@@ -140,8 +120,28 @@ fn main() {
 						})
 					});
 
+					// cleanup any fds that have closed unexpectedly
 					conn_manager.clean_err_fds();
-					conn_manager.regenerate_pollfds();
+
+					// handle listener after receiving messages and cleaning up so we don't
+					// affect the polled file descriptors
+					match listener.accept() {
+						Ok((stream, addr)) => {
+							stream
+								.set_nonblocking(true)
+								.expect("stream.set_nonblocking failed");
+							let ip = addr.ip();
+							if node.is_other_node(&ip) {
+								conn_manager.register_node(NodeAddr::new(ip), stream);
+							} else {
+								conn_manager.register_client(ClientAddr::new(addr), stream);
+							}
+						}
+						Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+							println!("no new connections!");
+						}
+						Err(e) => panic!("encountered IO error: {}", e),
+					}
 				}
 			}
 			None => {

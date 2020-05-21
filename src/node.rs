@@ -23,6 +23,7 @@ struct LeaderData<CA, REQ> {
 	next_index: Vec<LogIndex>,
 	match_index: Vec<LogIndex>,
 
+	client_addrs: HashMap<LogIndex, CA>,
 	reader_next: ReaderIndex,
 	reader_index: Vec<ReaderIndex>,
 	reader_queue: VecDeque<(ReaderIndex, CA, REQ)>,
@@ -76,7 +77,6 @@ pub struct Node<'a, NA, ENT, CA, REQ, RES, SM> {
 	soft_state: VolatileData,
 	statemachine: SM,
 
-	client_addrs: HashMap<LogIndex, CA>,
 	_client_req: PhantomData<REQ>,
 	_client_res: PhantomData<RES>,
 }
@@ -116,6 +116,7 @@ impl<CA, REQ> LeaderData<CA, REQ> {
 			next_index: vec![last_log_index + 1; num_others],
 			match_index: vec![0; num_others],
 
+			client_addrs: HashMap::new(),
 			reader_next: 0,
 			reader_index: vec![0; num_others],
 			reader_queue: VecDeque::new(),
@@ -155,7 +156,6 @@ where
 			soft_state: VolatileData::new(),
 			statemachine: SM::new(),
 
-			client_addrs: HashMap::new(),
 			_client_req: PhantomData,
 			_client_res: PhantomData,
 		}
@@ -192,14 +192,21 @@ where
 		if msg.get_term() > self.hard_state.curr_term {
 			self.hard_state.curr_term = msg.get_term();
 			self.hard_state.voted_for = None;
-			if let NodeType::Leader(_) = &self.curr_type {
-				let mut client_updates: Vec<Message<NA, ENT, CA, RES>> = self
+			if let NodeType::Leader(lead) = &self.curr_type {
+				let mut client_updates: Vec<Message<NA, ENT, CA, RES>> = lead
 					.client_addrs
 					.values()
 					.map(|addr| Message::Client(addr.clone(), ClientResponse::TryAgain))
 					.collect();
 
+				let mut reader_updates: Vec<Message<NA, ENT, CA, RES>> = lead
+					.reader_queue
+					.iter()
+					.map(|tup| Message::Client(tup.1.clone(), ClientResponse::TryAgain))
+					.collect();
+
 				to_ret.append(&mut client_updates);
+				to_ret.append(&mut reader_updates);
 			}
 			self.curr_type = NodeType::Follower;
 		}
@@ -357,7 +364,7 @@ where
 							.append_entry((self.hard_state.curr_term, Some(new_entry)));
 
 						// add client addr to map in case we should return something
-						self.client_addrs.insert(log_idx, client);
+						leader_data.client_addrs.insert(log_idx, client);
 						self._send_entries(false)
 					}
 				}
@@ -624,14 +631,14 @@ where
 			let idx = self.soft_state.last_applied;
 			if let Some(entry) = &self.hard_state.get_entry(idx).1 {
 				let res = self.statemachine.apply(entry);
-				match self.curr_type {
-					NodeType::Leader(_) => {
-						if self.client_addrs.contains_key(&idx) {
+				match &mut self.curr_type {
+					NodeType::Leader(lead) => {
+						if lead.client_addrs.contains_key(&idx) {
 							to_ret.push(Message::Client(
-								self.client_addrs[&idx].clone(),
+								lead.client_addrs[&idx].clone(),
 								ClientResponse::Response(res),
 							));
-							self.client_addrs.remove_entry(&idx);
+							lead.client_addrs.remove_entry(&idx);
 						}
 					}
 					_ => {}

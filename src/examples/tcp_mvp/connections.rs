@@ -322,14 +322,18 @@ where
 		match mesg {
 			Message::Node(addr, msg) => self.send_node(&NodeAddr { addr }, vec![msg]),
 			Message::Client(addr, res) => match res {
-				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string(), false),
-				ClientResponse::Redirect(a) => {
-					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()), true)
+				ClientResponse::Response(s) => {
+					self.send_client(&addr, &format!("{}\n", s.to_string()), false)
 				}
+				ClientResponse::Redirect(a) => self.send_client(
+					&addr,
+					&format!("leader is likely: {}\n", a.to_string()),
+					true,
+				),
 				ClientResponse::TryAgain => {
 					self.send_client(
 						&addr,
-						"no known leader. try again another node another time",
+						"no known leader. try again another node another time\n",
 						true,
 					);
 				}

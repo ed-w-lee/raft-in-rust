@@ -174,6 +174,11 @@ where
 	}
 
 	fn update_entries(&mut self, start: LogIndex, entries: &[(Term, Option<E>)]) {
+		println!(
+			"updating file storage starting at: {} with {:?}",
+			start, entries
+		);
+
 		self
 			.entries_file
 			.seek(SeekFrom::Start(0))
@@ -182,10 +187,15 @@ where
 		if start == 0 {
 			assert!(entries.is_empty());
 			// handle empty case
+			let to_write = start.to_bytes();
 			self
 				.entries_file
-				.write_all(&start.to_bytes())
+				.write_all(&to_write)
 				.expect("fuck couldn't write");
+			self
+				.entries_file
+				.set_len(to_write.len() as u64)
+				.expect("couldn't truncate file");
 			return;
 		}
 
@@ -220,12 +230,14 @@ where
 			// we are overwriting other entries, find where to seek to
 			for _ in 0..(start - 1) {
 				let tup = Term::from_bytes(slice).expect("blah");
-				let (to_shift, _) = tup;
+				let (to_shift, term) = tup;
 				slice = &slice[to_shift..];
 
 				let tup = Option::<E>::from_bytes(slice).expect("fuck");
-				let (to_shift, _) = tup;
+				let (to_shift, opt) = tup;
 				slice = &slice[to_shift..];
+
+				println!("iterating... read: {:?}", (term, opt));
 			}
 
 			let did_read = total_len - slice.len();
@@ -237,6 +249,11 @@ where
 			// we are appending to log. don't seek anywhere
 			assert_eq!(start, *log_len + 1);
 		}
+		let curr_pos = self
+			.entries_file
+			.seek(SeekFrom::Current(0))
+			.expect("couldn't seek to curr_pos");
+		println!("starting write from {}", curr_pos);
 		// write log entries
 		let mut to_write = vec![];
 		for tup in entries {
@@ -258,6 +275,10 @@ where
 			.entries_file
 			.write_all(&(start + (entries.len() as u64) - 1).to_bytes())
 			.expect("no write rip");
+		self
+			.entries_file
+			.set_len(curr_pos + to_write.len() as u64)
+			.expect("couldn't truncate file");
 
 		self
 			.entries_file

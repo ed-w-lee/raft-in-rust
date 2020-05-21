@@ -253,6 +253,10 @@ where
 						.position(|&a| a == res.from)
 						.unwrap();
 
+					if lead.reader_index[other_idx] < res.reader_idx {
+						lead.reader_index[other_idx] = res.reader_idx;
+					}
+
 					match res.success {
 						Ok(match_idx) => {
 							if lead.match_index[other_idx] < match_idx {
@@ -268,12 +272,6 @@ where
 								if self.hard_state.get_term(next_commit).unwrap() == self.hard_state.curr_term {
 									// only update our commit index when we've written something as leader
 									self.soft_state.commit_index = next_commit;
-									if self.hard_state.curr_term == res.term {
-										// make sure response is from our term so no confusions about what reader index refers to
-										if lead.reader_index[other_idx] < res.reader_idx {
-											lead.reader_index[other_idx] = res.reader_idx;
-										}
-									}
 								}
 							}
 						}

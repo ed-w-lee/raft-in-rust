@@ -229,7 +229,7 @@ where
 					// we know this is going to reject, but whatever
 					NodeMessage::VoteReq(req) => vec![self._handle_request_vote(req, at)],
 					NodeMessage::VoteRes(res) => {
-						if res.vote_granted {
+						if res.term == self.hard_state.curr_term && res.vote_granted {
 							cand.votes.insert(res.from);
 
 							if cand.votes.len() > (self.other_addrs.len() + 1) / 2 {
@@ -243,6 +243,10 @@ where
 			}
 			NodeType::Leader(lead) => match msg {
 				NodeMessage::AppendRes(res) => {
+					if res.term < self.hard_state.curr_term {
+						// in case we found an old message
+						return vec![];
+					}
 					let other_idx: usize = self
 						.other_addrs
 						.iter()
@@ -250,31 +254,34 @@ where
 						.unwrap();
 
 					match res.success {
-						Some(log_idx) => {
-							assert!(lead.next_index[other_idx] <= log_idx + 1);
-							// node is up-to-date until given idx
-							lead.match_index[other_idx] = log_idx;
-							lead.next_index[other_idx] = log_idx + 1;
+						Ok(match_idx) => {
+							if lead.match_index[other_idx] < match_idx {
+								// node is up-to-date until given idx
+								lead.match_index[other_idx] = match_idx;
+								lead.next_index[other_idx] = match_idx + 1;
 
-							let mut find_commit = lead.match_index.clone();
-							find_commit.sort();
-							// 4 other_addrs requires 2
-							// 5 other_addrs requires 3
-							let next_commit = find_commit[(self.other_addrs.len() + 1) / 2];
-							if self.hard_state.get_term(next_commit).unwrap() == self.hard_state.curr_term {
-								// only update our commit index when we've written something as leader
-								self.soft_state.commit_index = next_commit;
-								if self.hard_state.curr_term == res.term {
-									// make sure response is from our term so no confusions about what reader index refers to
-									if lead.reader_index[other_idx] < res.reader_idx {
-										lead.reader_index[other_idx] = res.reader_idx;
+								let mut find_commit = lead.match_index.clone();
+								find_commit.sort();
+								// 4 other_addrs requires 2
+								// 5 other_addrs requires 3
+								let next_commit = find_commit[(self.other_addrs.len() + 1) / 2];
+								if self.hard_state.get_term(next_commit).unwrap() == self.hard_state.curr_term {
+									// only update our commit index when we've written something as leader
+									self.soft_state.commit_index = next_commit;
+									if self.hard_state.curr_term == res.term {
+										// make sure response is from our term so no confusions about what reader index refers to
+										if lead.reader_index[other_idx] < res.reader_idx {
+											lead.reader_index[other_idx] = res.reader_idx;
+										}
 									}
 								}
 							}
 						}
-						None => {
-							// get idx
-							lead.next_index[other_idx] -= 1;
+						Err(next_idx) => {
+							// node needs entries at least starting from given idx
+							if lead.match_index[other_idx] < next_idx && lead.next_index[other_idx] > next_idx {
+								lead.next_index[other_idx] = next_idx;
+							}
 						}
 					}
 					match self._send_entries_to_node(self.other_addrs[other_idx].clone(), false) {
@@ -473,7 +480,7 @@ where
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
 					from: self.my_id,
-					success: None,
+					success: Err(req.prev_log_index),
 					reader_idx: req.reader_idx,
 				}),
 			)
@@ -502,7 +509,7 @@ where
 				NodeMessage::AppendRes(AppendEntriesResponse {
 					term: self.hard_state.curr_term,
 					from: self.my_id,
-					success: Some(self.hard_state.last_entry()),
+					success: Ok(self.hard_state.last_entry()),
 					reader_idx: req.reader_idx,
 				}),
 			)

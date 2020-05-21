@@ -270,6 +270,7 @@ where
 
 			let tup = self.client_parse.parse(&addr, stream);
 			let msgs = tup.0;
+			let msg_len = msgs.len();
 			msg_map.insert(addr.clone(), msgs);
 
 			let status = tup.1;
@@ -288,11 +289,27 @@ where
 					self.client_streams.remove_entry(&addr_to_rem);
 				}
 				ParseStatus::Done => {
-					println!("mark connection as shouldn't poll");
-					client_updated = true;
-					// mark that we shouldn't poll anymore (we may still want to send things to them later)
-					let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
-					tup.0 = false;
+					if msg_len > 0 {
+						println!(
+							"mark stream {} as shouldn't poll since {} msgs",
+							stream.as_raw_fd(),
+							msg_len
+						);
+						client_updated = true;
+						// mark that we shouldn't poll anymore (we may still want to attempt to send things to them later)
+						let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
+						tup.0 = false;
+					} else {
+						println!(
+							"clean up stream {} address {:?} since finished reading",
+							stream.as_raw_fd(),
+							addr
+						);
+						client_updated = true;
+						let addr_to_rem = addr.clone();
+						self.client_fds.remove_entry(&stream.as_raw_fd());
+						self.client_streams.remove_entry(&addr_to_rem);
+					}
 				}
 			}
 		}
@@ -385,20 +402,33 @@ where
 	}
 
 	fn send_client(&mut self, addr: &ClientAddr, msg: &str, close: bool) {
+		println!("sent to client {:?} message: {:?}", addr, msg);
+
 		match self.client_streams.get_mut(addr) {
 			Some(stream) => {
+				let mut to_clean: bool = close || !self.client_fds.get(&stream.as_raw_fd()).unwrap().0;
 				match stream.write_all(msg.as_bytes()) {
 					Ok(_) => {}
-					Err(_) => {}
+					Err(_) => {
+						to_clean = true;
+					}
 				};
-				if close || !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
+				println!(
+					"identified stream {:?} with to_clean as: {}",
+					stream.as_raw_fd(),
+					to_clean
+				);
+				if to_clean {
+					println!("removing client from connections");
 					self.client_fds.remove_entry(&stream.as_raw_fd());
 					self.client_streams.remove_entry(addr);
 
 					self.updates.client_updated = true;
 				}
 			}
-			None => panic!("unable to find key for client_streams"),
+			None => {
+				println!("couldn't find client, likely cleaned up.");
+			}
 		}
 	}
 

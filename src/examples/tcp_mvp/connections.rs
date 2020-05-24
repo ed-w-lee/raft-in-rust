@@ -1,7 +1,6 @@
 // use crate::entry::Entry;
 use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
 use crate::serialize::Serialize;
-use crate::LISTEN_PORT;
 
 use rafted::message::{ClientResponse, Message, NodeMessage};
 
@@ -58,7 +57,7 @@ pub struct ConnUpdates {
 ///
 pub struct Connections<M, E, RES> {
 	my_addr: IpAddr,
-	next_port: u16,
+	connect_port: u16,
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
@@ -81,12 +80,13 @@ where
 	pub fn new(
 		my_addr: IpAddr,
 		listener: &TcpListener,
+		connect_port: u16,
 		node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
 		client_parse: Box<dyn ClientParse<TcpStream, M>>,
 	) -> Self {
 		Connections {
 			my_addr,
-			next_port: 6000,
+			connect_port,
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
 				*(&mut data[0]) = MaybeUninit::new(pollfd(listener.as_raw_fd()));
@@ -376,8 +376,7 @@ where
 			loop {
 				match build.bind(SocketAddr::new(self.my_addr, 0)) {
 					Ok(b) => {
-						self.next_port += 1;
-						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, LISTEN_PORT)) {
+						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, self.connect_port)) {
 							stream
 								.set_nonblocking(true)
 								.expect("unable to set nonblocking");
@@ -388,7 +387,7 @@ where
 						}
 						break;
 					}
-					Err(_) => self.next_port += 1,
+					Err(_) => (),
 				}
 			}
 		}

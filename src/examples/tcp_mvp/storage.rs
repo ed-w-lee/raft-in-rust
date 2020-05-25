@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 pub struct FileStorage<A, E> {
 	state_file: File,
 	entries_file: File,
+	entries_end: u64,
 	_addr: PhantomData<A>,
 	_entry: PhantomData<E>,
 }
@@ -35,6 +36,7 @@ where
 				.create(true)
 				.open(format!("{}/entries", my_dir))
 				.unwrap(),
+			entries_end: 0,
 			_addr: PhantomData,
 			_entry: PhantomData,
 		}
@@ -109,6 +111,8 @@ where
 			slice = &slice[to_shift..];
 			log.push((*my_term, *my_entry));
 		}
+
+		self.entries_end = (entries_buf.len() - slice.len()) as u64;
 
 		Some((*curr_term, *voted_for, *first_index, *first_term, log))
 	}
@@ -192,10 +196,7 @@ where
 				.entries_file
 				.write_all(&to_write)
 				.expect("fuck couldn't write");
-			self
-				.entries_file
-				.set_len(to_write.len() as u64)
-				.expect("couldn't truncate file");
+			self.entries_end = to_write.len() as u64;
 			return;
 		}
 
@@ -214,45 +215,49 @@ where
 
 		if entries.is_empty() {
 			assert!(start <= *log_len);
+			let to_write = start.to_bytes();
 			self
 				.entries_file
 				.seek(SeekFrom::Start(0))
 				.expect("couldn't seek to start");
 			self
 				.entries_file
-				.write_all(&start.to_bytes())
+				.write_all(&to_write)
 				.expect("fuck couldn't write");
+			self.entries_end = to_write.len() as u64;
 
 			return;
 		}
 
-		if *log_len >= start {
-			// we are overwriting other entries, find where to seek to
-			for _ in 0..(start - 1) {
-				let tup = Term::from_bytes(slice).expect("blah");
-				let (to_shift, term) = tup;
-				slice = &slice[to_shift..];
+		let curr_pos = {
+			if *log_len >= start {
+				// we are overwriting other entries, find where to seek to
+				for _ in 0..(start - 1) {
+					let tup = Term::from_bytes(slice).expect("blah");
+					let (to_shift, term) = tup;
+					slice = &slice[to_shift..];
 
-				let tup = Option::<E>::from_bytes(slice).expect("fuck");
-				let (to_shift, opt) = tup;
-				slice = &slice[to_shift..];
+					let tup = Option::<E>::from_bytes(slice).expect("fuck");
+					let (to_shift, opt) = tup;
+					slice = &slice[to_shift..];
 
-				println!("iterating... read: {:?}", (term, opt));
+					println!("iterating... read: {:?}", (term, opt));
+				}
+
+				let did_read = total_len - slice.len();
+				self
+					.entries_file
+					.seek(SeekFrom::Start(did_read as u64))
+					.expect("couldn't seek to overwrite location")
+			} else {
+				// we are appending to log. seek to end
+				assert_eq!(start, *log_len + 1);
+				self
+					.entries_file
+					.seek(SeekFrom::Start(self.entries_end))
+					.expect("couldn't seek to append location")
 			}
-
-			let did_read = total_len - slice.len();
-			self
-				.entries_file
-				.seek(SeekFrom::Start(did_read as u64))
-				.expect("couldn't seek to start");
-		} else {
-			// we are appending to log. don't seek anywhere
-			assert_eq!(start, *log_len + 1);
-		}
-		let curr_pos = self
-			.entries_file
-			.seek(SeekFrom::Current(0))
-			.expect("couldn't seek to curr_pos");
+		};
 		println!("starting write from {}", curr_pos);
 		// write log entries
 		let mut to_write = vec![];
@@ -275,14 +280,11 @@ where
 			.entries_file
 			.write_all(&(start + (entries.len() as u64) - 1).to_bytes())
 			.expect("no write rip");
-		self
-			.entries_file
-			.set_len(curr_pos + to_write.len() as u64)
-			.expect("couldn't truncate file");
 
 		self
 			.entries_file
 			.sync_data()
 			.expect("Couldn't sync successfully");
+		self.entries_end = curr_pos + to_write.len() as u64;
 	}
 }

@@ -4,11 +4,11 @@ use crate::serialize::Serialize;
 
 use rafted::message::{ClientResponse, Message, NodeMessage};
 
-use fnv::FnvHashMap;
 use libc::{self, POLLERR, POLLHUP, POLLIN, POLLNVAL};
 use net2::TcpBuilder;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -18,23 +18,41 @@ use std::ptr::{copy, drop_in_place};
 
 const MAX_FDS: usize = 900;
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub struct NodeAddr {
 	addr: IpAddr,
+	idx: usize,
 }
 impl NodeAddr {
-	pub fn new(addr: IpAddr) -> Self {
-		Self { addr }
+	pub fn new(addr: IpAddr, idx: usize) -> Self {
+		Self { addr, idx }
+	}
+}
+impl Hash for NodeAddr {
+	fn hash<H>(&self, state: &mut H)
+	where
+		H: Hasher,
+	{
+		&self.idx.hash(state);
 	}
 }
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub struct ClientAddr {
 	addr: SocketAddr,
+	fd: i32,
 }
 impl ClientAddr {
-	pub fn new(addr: SocketAddr) -> ClientAddr {
-		ClientAddr { addr }
+	pub fn new(addr: SocketAddr, fd: i32) -> ClientAddr {
+		ClientAddr { addr, fd }
+	}
+}
+impl Hash for ClientAddr {
+	fn hash<H>(&self, state: &mut H)
+	where
+		H: Hasher,
+	{
+		&self.fd.hash(state);
 	}
 }
 
@@ -57,15 +75,16 @@ pub struct ConnUpdates {
 ///
 pub struct Connections<M, E, RES> {
 	my_addr: IpAddr,
+	other_ips: Vec<IpAddr>,
 	connect_port: u16,
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
 	node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
-	node_fds: FnvHashMap<RawFd, NodeAddr>,
+	node_fds: HashMap<RawFd, NodeAddr>,
 	node_streams: HashMap<NodeAddr, TcpStream>,
 	client_parse: Box<dyn ClientParse<TcpStream, M>>,
-	client_fds: FnvHashMap<RawFd, (bool, ClientAddr)>,
+	client_fds: HashMap<RawFd, (bool, ClientAddr)>,
 	client_streams: HashMap<ClientAddr, TcpStream>,
 	updates: ConnUpdates,
 	_response: PhantomData<RES>,
@@ -79,6 +98,7 @@ where
 {
 	pub fn new(
 		my_addr: IpAddr,
+		other_ips: Vec<IpAddr>,
 		listener: &TcpListener,
 		connect_port: u16,
 		node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
@@ -86,6 +106,7 @@ where
 	) -> Self {
 		Connections {
 			my_addr,
+			other_ips,
 			connect_port,
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
@@ -95,10 +116,10 @@ where
 			node_end: 1,
 			curr_len: 1,
 			node_parse,
-			node_fds: FnvHashMap::default(),
+			node_fds: HashMap::new(),
 			node_streams: HashMap::new(),
 			client_parse,
-			client_fds: FnvHashMap::default(),
+			client_fds: HashMap::new(),
 			client_streams: HashMap::new(),
 			updates: ConnUpdates {
 				node_updated: false,
@@ -161,14 +182,14 @@ where
 		self.updates.client_updated = true;
 	}
 
-	pub fn get_node_msgs(&mut self) -> FnvHashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
+	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[1..self.node_end]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		let mut msg_map: FnvHashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = FnvHashMap::default();
+		let mut msg_map: HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = HashMap::new();
 		let mut node_updated = false;
 		for pfd in pfds_to_read {
 			let addr = self
@@ -245,14 +266,14 @@ where
 		}
 	}
 
-	pub fn get_client_msgs(&mut self) -> FnvHashMap<ClientAddr, Vec<M>> {
+	pub fn get_client_msgs(&mut self) -> HashMap<ClientAddr, Vec<M>> {
 		let pfds_to_read: Vec<&libc::pollfd> = self.pollfds[self.node_end..self.curr_len]
 			.iter()
 			.map(|pfd| unsafe { &*pfd.as_ptr() })
 			.filter(|pfd| pfd.revents & POLLIN != 0)
 			.collect();
 
-		let mut msg_map: FnvHashMap<ClientAddr, Vec<M>> = FnvHashMap::default();
+		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
 		let mut client_updated = false;
 		for pfd in pfds_to_read {
 			let tup = self
@@ -320,7 +341,10 @@ where
 
 	pub fn send_message(&mut self, mesg: Message<IpAddr, E, ClientAddr, RES>) {
 		match mesg {
-			Message::Node(addr, msg) => self.send_node(&NodeAddr { addr }, vec![msg]),
+			Message::Node(addr, msg) => {
+				let other_idx: usize = self.other_ips.iter().position(|&a| a == addr).unwrap();
+				self.send_node(&NodeAddr::new(addr, other_idx), vec![msg])
+			}
 			Message::Client(addr, res) => match res {
 				ClientResponse::Response(s) => {
 					self.send_client(&addr, &format!("{}\n", s.to_string()), false)

@@ -14,6 +14,7 @@ mod storage;
 use connections::{ClientAddr, Connections, NodeAddr};
 use msgparse::{ClientParser, NodeParser};
 use statemachines::BasicStateMachine;
+use std::os::unix::io::AsRawFd;
 use storage::FileStorage;
 
 use std::io;
@@ -58,7 +59,7 @@ fn run_node(config: Config) {
 			let storage: FileStorage<IpAddr, u64> = FileStorage::new(config.my_addr);
 			let mut node: Node<IpAddr, u64, ClientAddr, (), u64, BasicStateMachine> = Node::new(
 				config.my_addr,
-				config.other_ips,
+				config.other_ips.clone(),
 				Instant::now(),
 				config.election_timeout,
 				config.heartbeat_timeout,
@@ -76,6 +77,7 @@ fn run_node(config: Config) {
 			let c_parser: ClientParser = ClientParser::new();
 			let mut conn_manager: Connections<u64, u64, u64> = Connections::new(
 				config.my_addr,
+				config.other_ips.clone(),
 				&listener,
 				config.connect_port,
 				Box::new(n_parser),
@@ -150,9 +152,10 @@ fn run_node(config: Config) {
 										.expect("stream.set_nonblocking failed");
 									let ip = addr.ip();
 									if node.is_other_node(&ip) {
-										conn_manager.register_node(NodeAddr::new(ip), stream);
+										let other_idx: usize = config.other_ips.iter().position(|&a| a == ip).unwrap();
+										conn_manager.register_node(NodeAddr::new(ip, other_idx), stream);
 									} else {
-										conn_manager.register_client(ClientAddr::new(addr), stream);
+										conn_manager.register_client(ClientAddr::new(addr, stream.as_raw_fd()), stream);
 									}
 								}
 								Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {

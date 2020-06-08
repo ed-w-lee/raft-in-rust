@@ -151,6 +151,7 @@ where
 			if self.my_addr < addr.addr {
 				return;
 			} else {
+				println!("cleared existing node entry");
 				let old_stream = self
 					.node_streams
 					.remove_entry(&addr)
@@ -169,13 +170,17 @@ where
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		// *(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
-		// self.curr_len += 1;
-		// println!(
-		// 	"registered client: pollfd {{ fd: {}, events: {} }}",
-		// 	unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
-		// 	unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
-		// );
+		println!("registered client with fd: {}", stream.as_raw_fd(),);
+
+		if self.client_streams.contains_key(&addr) {
+			println!("cleared existing client entry");
+
+			let old_stream = self
+				.client_streams
+				.remove_entry(&addr)
+				.expect("node streams doesn't contain stream to remove");
+			self.client_fds.remove_entry(&old_stream.1.as_raw_fd());
+		}
 
 		self.client_fds.insert(stream.as_raw_fd(), (true, addr));
 		self.client_streams.insert(addr, stream);
@@ -190,7 +195,7 @@ where
 			.collect();
 
 		let mut msg_map: HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = HashMap::new();
-		let mut node_updated = false;
+		let mut node_updated = self.updates.node_updated;
 		for pfd in pfds_to_read {
 			let addr = self
 				.node_fds
@@ -219,6 +224,11 @@ where
 					// node somehow hit EOF, this shouldn't happen so we clean up connection
 					node_updated = true;
 					let addr_to_rem = addr.clone();
+					println!(
+						"removing addr: {:?}, with fd: {}",
+						&addr_to_rem,
+						stream.as_raw_fd()
+					);
 					self.node_fds.remove_entry(&stream.as_raw_fd());
 					self.node_streams.remove_entry(&addr_to_rem);
 				}
@@ -274,7 +284,7 @@ where
 			.collect();
 
 		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
-		let mut client_updated = false;
+		let mut client_updated = self.updates.client_updated;
 		for pfd in pfds_to_read {
 			let tup = self
 				.client_fds
@@ -460,6 +470,10 @@ where
 	}
 
 	pub fn regenerate_pollfds(&mut self) {
+		println!(
+			"regenerating pollfds with ({},{})",
+			self.updates.client_updated, self.updates.node_updated
+		);
 		match (self.updates.client_updated, self.updates.node_updated) {
 			(false, false) => {}
 			(true, false) => {

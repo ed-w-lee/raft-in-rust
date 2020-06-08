@@ -56,7 +56,7 @@ impl Config {
 fn run_node(config: Config) {
 	match config.validate() {
 		Ok(_) => {
-			let storage: FileStorage<IpAddr, u64> = FileStorage::new(config.my_addr);
+			let storage: FileStorage<IpAddr, u64> = FileStorage::new(config.my_addr, config.listen_port);
 			let mut node: Node<IpAddr, u64, ClientAddr, (), u64, BasicStateMachine> = Node::new(
 				config.my_addr,
 				config.other_ips.clone(),
@@ -145,23 +145,28 @@ fn run_node(config: Config) {
 
 							// handle listener after receiving messages and cleaning up so we don't
 							// affect the polled file descriptors
-							match listener.accept() {
-								Ok((stream, addr)) => {
-									stream
-										.set_nonblocking(true)
-										.expect("stream.set_nonblocking failed");
-									let ip = addr.ip();
-									if node.is_other_node(&ip) {
-										let other_idx: usize = config.other_ips.iter().position(|&a| a == ip).unwrap();
-										conn_manager.register_node(NodeAddr::new(ip, other_idx), stream);
-									} else {
-										conn_manager.register_client(ClientAddr::new(addr, stream.as_raw_fd()), stream);
+							loop {
+								match listener.accept() {
+									Ok((stream, addr)) => {
+										stream
+											.set_nonblocking(true)
+											.expect("stream.set_nonblocking failed");
+										let ip = addr.ip();
+										if node.is_other_node(&ip) {
+											let other_idx: usize =
+												config.other_ips.iter().position(|&a| a == ip).unwrap();
+											conn_manager.register_node(NodeAddr::new(ip, other_idx), stream);
+										} else {
+											conn_manager
+												.register_client(ClientAddr::new(addr, stream.as_raw_fd()), stream);
+										}
 									}
+									Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+										println!("no new connections!");
+										break;
+									}
+									Err(e) => panic!("encountered IO error: {}", e),
 								}
-								Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-									println!("no new connections!");
-								}
-								Err(e) => panic!("encountered IO error: {}", e),
 							}
 						}
 					}

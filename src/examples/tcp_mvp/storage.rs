@@ -24,8 +24,8 @@ impl<A, E> FileStorage<A, E>
 where
 	A: Display,
 {
-	pub fn new(addr: A) -> Self {
-		let my_dir = format!("/tmp/rafted_tcpmvp_{}", addr);
+	pub fn new(addr: A, port: u16) -> Self {
+		let my_dir = format!("/tmp/rafted_tcpmvp_{}_{}", addr, port);
 		create_dir_all(&my_dir).expect("failed to create required directory");
 		let state_file = format!("{}/state", &my_dir);
 		let state_back = state_file.clone() + TMP_SUFFIX;

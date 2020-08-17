@@ -138,7 +138,7 @@ where
 		let status = match stream.read_to_end(&mut buf) {
 			Ok(_) => ParseStatus::Done,
 			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ParseStatus::Waiting,
-			Err(e) => panic!("some io error: {}", e),
+			Err(e) => ParseStatus::Unexpected(format!("{}", e)),
 		};
 
 		let mut old_buflen = 0;

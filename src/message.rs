@@ -15,7 +15,7 @@ pub struct AppendEntries<NA, ENT> {
 pub struct AppendEntriesResponse<NA> {
 	pub term: Term,
 	pub from: NA,
-	pub success: Option<LogIndex>,
+	pub success: Result<LogIndex, LogIndex>,
 	pub reader_idx: ReaderIndex,
 }
 

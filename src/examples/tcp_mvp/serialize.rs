@@ -135,7 +135,7 @@ where
 		let (to_shift, term) = Term::from_bytes(buf)?;
 		buf = shift(buf, to_shift);
 
-		let (to_shift, success) = Option::<LogIndex>::from_bytes(buf)?;
+		let (to_shift, success) = Result::<LogIndex, LogIndex>::from_bytes(buf)?;
 		buf = shift(buf, to_shift);
 
 		let (to_shift, from) = NA::from_bytes(buf)?;
@@ -327,6 +327,44 @@ where
 	}
 }
 
+impl<A, B> Serialize for Result<A, B>
+where
+	A: Serialize,
+	B: Serialize,
+{
+	fn to_bytes(&self) -> Vec<u8> {
+		let mut buf = vec![];
+		match self {
+			Ok(obj_a) => {
+				buf.push(1u8);
+				buf.extend_from_slice(&obj_a.to_bytes());
+			}
+			Err(obj_b) => {
+				buf.push(0u8);
+				buf.extend_from_slice(&obj_b.to_bytes());
+			}
+		}
+		buf
+	}
+
+	fn from_bytes(buf: &[u8]) -> Result<(usize, Box<Self>), SerialStatus> {
+		let is_some = buf[0] > 0;
+		if is_some {
+			let slice = &buf[1..];
+			let tup = A::from_bytes(slice)?;
+			let (n_read, ret) = tup;
+
+			Ok((n_read + 1, Box::new(Ok(*ret))))
+		} else {
+			let slice = &buf[1..];
+			let tup = B::from_bytes(slice)?;
+			let (n_read, ret) = tup;
+
+			Ok((n_read + 1, Box::new(Err(*ret))))
+		}
+	}
+}
+
 impl<A, B> Serialize for (A, B)
 where
 	A: Serialize,
@@ -505,7 +543,7 @@ mod tests {
 		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
 			from: 15,
-			success: Some(10),
+			success: Ok(10),
 			reader_idx: 10,
 		};
 		let bytes = ae.to_bytes();
@@ -525,7 +563,7 @@ mod tests {
 		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
 			from: 15,
-			success: None,
+			success: Err(20),
 			reader_idx: 10,
 		};
 		let bytes = ae.to_bytes();
@@ -545,7 +583,7 @@ mod tests {
 		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
 			from: 15,
-			success: Some(10),
+			success: Ok(10),
 			reader_idx: 10,
 		};
 		let bytes = ae.to_bytes();
@@ -560,7 +598,7 @@ mod tests {
 		let ae: AppendEntriesResponse<u64> = AppendEntriesResponse {
 			term: 10,
 			from: 15,
-			success: Some(10),
+			success: Ok(10),
 			reader_idx: 10,
 		};
 		let mut bytes = ae.to_bytes();

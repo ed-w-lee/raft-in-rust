@@ -1,7 +1,6 @@
 // use crate::entry::Entry;
 use crate::msgparse::{ClientParse, NodeParse, ParseStatus};
 use crate::serialize::Serialize;
-use crate::LISTEN_PORT;
 
 use rafted::message::{ClientResponse, Message, NodeMessage};
 
@@ -9,6 +8,7 @@ use libc::{self, POLLERR, POLLHUP, POLLIN, POLLNVAL};
 use net2::TcpBuilder;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -18,23 +18,41 @@ use std::ptr::{copy, drop_in_place};
 
 const MAX_FDS: usize = 900;
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub struct NodeAddr {
 	addr: IpAddr,
+	idx: usize,
 }
 impl NodeAddr {
-	pub fn new(addr: IpAddr) -> Self {
-		Self { addr }
+	pub fn new(addr: IpAddr, idx: usize) -> Self {
+		Self { addr, idx }
+	}
+}
+impl Hash for NodeAddr {
+	fn hash<H>(&self, state: &mut H)
+	where
+		H: Hasher,
+	{
+		&self.idx.hash(state);
 	}
 }
 
-#[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub struct ClientAddr {
 	addr: SocketAddr,
+	fd: i32,
 }
 impl ClientAddr {
-	pub fn new(addr: SocketAddr) -> ClientAddr {
-		ClientAddr { addr }
+	pub fn new(addr: SocketAddr, fd: i32) -> ClientAddr {
+		ClientAddr { addr, fd }
+	}
+}
+impl Hash for ClientAddr {
+	fn hash<H>(&self, state: &mut H)
+	where
+		H: Hasher,
+	{
+		&self.fd.hash(state);
 	}
 }
 
@@ -57,7 +75,8 @@ pub struct ConnUpdates {
 ///
 pub struct Connections<M, E, RES> {
 	my_addr: IpAddr,
-	next_port: u16,
+	other_ips: Vec<IpAddr>,
+	connect_port: u16,
 	pollfds: [MaybeUninit<libc::pollfd>; MAX_FDS],
 	node_end: usize,
 	curr_len: usize,
@@ -79,13 +98,16 @@ where
 {
 	pub fn new(
 		my_addr: IpAddr,
+		other_ips: Vec<IpAddr>,
 		listener: &TcpListener,
+		connect_port: u16,
 		node_parse: Box<dyn NodeParse<TcpStream, IpAddr, E>>,
 		client_parse: Box<dyn ClientParse<TcpStream, M>>,
 	) -> Self {
 		Connections {
 			my_addr,
-			next_port: 6000,
+			other_ips,
+			connect_port,
 			pollfds: unsafe {
 				let mut data: [MaybeUninit<libc::pollfd>; MAX_FDS] = MaybeUninit::uninit().assume_init();
 				*(&mut data[0]) = MaybeUninit::new(pollfd(listener.as_raw_fd()));
@@ -109,9 +131,10 @@ where
 
 	pub fn poll(&mut self, timeout: i32) -> i32 {
 		println!(
-			"poll status: \n\tlast pollfd {{ fd: {}, events: {} }}\n\tnode fds: {}, client fds: {}",
+			"poll status: \n\tlast pollfd {{ fd: {}, events: {} }}\n\tcurr_len: {}, node fds: {}, client fds: {}",
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
 			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events,
+			self.curr_len,
 			self.node_fds.len(),
 			self.client_fds.len()
 		);
@@ -123,24 +146,23 @@ where
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		// shift over any client pollfds
-		if self.node_end < self.curr_len {
-			unsafe {
-				copy(
-					self.pollfds[self.node_end].as_ptr(),
-					self.pollfds[self.node_end + 1].as_mut_ptr(),
-					self.curr_len - self.node_end,
-				)
+		// prefer existing connections to this new one
+		if self.node_streams.contains_key(&addr) {
+			if self.my_addr < addr.addr {
+				return;
+			} else {
+				println!("cleared existing node entry");
+				let old_stream = self
+					.node_streams
+					.remove_entry(&addr)
+					.expect("node_streams doesn't contain stream to remove");
+				self.node_fds.remove_entry(&old_stream.1.as_raw_fd());
 			}
 		}
 
-		// insert node pollfd
-		*(&mut self.pollfds[self.node_end]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
-		self.node_end += 1;
-		self.curr_len += 1;
-
 		self.node_fds.insert(stream.as_raw_fd(), addr);
 		self.node_streams.insert(addr, stream);
+		self.updates.node_updated = true;
 	}
 
 	pub fn register_client(&mut self, addr: ClientAddr, stream: TcpStream) {
@@ -148,16 +170,21 @@ where
 			panic!("hit self-imposed limit on file descriptors");
 		}
 
-		*(&mut self.pollfds[self.curr_len]) = MaybeUninit::new(pollfd(stream.as_raw_fd()));
-		self.curr_len += 1;
-		println!(
-			"registered client: pollfd {{ fd: {}, events: {} }}",
-			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.fd,
-			unsafe { *self.pollfds[self.curr_len - 1].as_ptr() }.events
-		);
+		println!("registered client with fd: {}", stream.as_raw_fd(),);
+
+		if self.client_streams.contains_key(&addr) {
+			println!("cleared existing client entry");
+
+			let old_stream = self
+				.client_streams
+				.remove_entry(&addr)
+				.expect("node streams doesn't contain stream to remove");
+			self.client_fds.remove_entry(&old_stream.1.as_raw_fd());
+		}
 
 		self.client_fds.insert(stream.as_raw_fd(), (true, addr));
 		self.client_streams.insert(addr, stream);
+		self.updates.client_updated = true;
 	}
 
 	pub fn get_node_msgs(&mut self) -> HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> {
@@ -168,7 +195,7 @@ where
 			.collect();
 
 		let mut msg_map: HashMap<NodeAddr, Vec<NodeMessage<IpAddr, E>>> = HashMap::new();
-		let mut node_updated = false;
+		let mut node_updated = self.updates.node_updated;
 		for pfd in pfds_to_read {
 			let addr = self
 				.node_fds
@@ -197,6 +224,11 @@ where
 					// node somehow hit EOF, this shouldn't happen so we clean up connection
 					node_updated = true;
 					let addr_to_rem = addr.clone();
+					println!(
+						"removing addr: {:?}, with fd: {}",
+						&addr_to_rem,
+						stream.as_raw_fd()
+					);
 					self.node_fds.remove_entry(&stream.as_raw_fd());
 					self.node_streams.remove_entry(&addr_to_rem);
 				}
@@ -238,7 +270,8 @@ where
 				self.client_streams.remove_entry(&addr_to_rem);
 				self.updates.client_updated = true;
 			} else {
-				panic!("found pfd that wasn't registered")
+				// this is likely a pfd that got cleaned up through an unsuccessful read/write
+				println!("WARN - found pfd that wasn't registered")
 			}
 		}
 	}
@@ -251,7 +284,7 @@ where
 			.collect();
 
 		let mut msg_map: HashMap<ClientAddr, Vec<M>> = HashMap::new();
-		let mut client_updated = false;
+		let mut client_updated = self.updates.client_updated;
 		for pfd in pfds_to_read {
 			let tup = self
 				.client_fds
@@ -268,6 +301,7 @@ where
 
 			let tup = self.client_parse.parse(&addr, stream);
 			let msgs = tup.0;
+			let msg_len = msgs.len();
 			msg_map.insert(addr.clone(), msgs);
 
 			let status = tup.1;
@@ -286,11 +320,27 @@ where
 					self.client_streams.remove_entry(&addr_to_rem);
 				}
 				ParseStatus::Done => {
-					println!("mark connection as shouldn't poll");
-					client_updated = true;
-					// mark that we shouldn't poll anymore (we may still want to send things to them later)
-					let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
-					tup.0 = false;
+					if msg_len > 0 {
+						println!(
+							"mark stream {} as shouldn't poll since {} msgs",
+							stream.as_raw_fd(),
+							msg_len
+						);
+						client_updated = true;
+						// mark that we shouldn't poll anymore (we may still want to attempt to send things to them later)
+						let tup = self.client_fds.get_mut(&pfd.fd).unwrap();
+						tup.0 = false;
+					} else {
+						println!(
+							"clean up stream {} address {:?} since finished reading",
+							stream.as_raw_fd(),
+							addr
+						);
+						client_updated = true;
+						let addr_to_rem = addr.clone();
+						self.client_fds.remove_entry(&stream.as_raw_fd());
+						self.client_streams.remove_entry(&addr_to_rem);
+					}
 				}
 			}
 		}
@@ -301,16 +351,23 @@ where
 
 	pub fn send_message(&mut self, mesg: Message<IpAddr, E, ClientAddr, RES>) {
 		match mesg {
-			Message::Node(addr, msg) => self.send_node(&NodeAddr { addr }, vec![msg]),
+			Message::Node(addr, msg) => {
+				let other_idx: usize = self.other_ips.iter().position(|&a| a == addr).unwrap();
+				self.send_node(&NodeAddr::new(addr, other_idx), vec![msg])
+			}
 			Message::Client(addr, res) => match res {
-				ClientResponse::Response(s) => self.send_client(&addr, &s.to_string(), false),
-				ClientResponse::Redirect(a) => {
-					self.send_client(&addr, &format!("leader is likely: {}", a.to_string()), true)
+				ClientResponse::Response(s) => {
+					self.send_client(&addr, &format!("{}\n", s.to_string()), false)
 				}
+				ClientResponse::Redirect(a) => self.send_client(
+					&addr,
+					&format!("leader is likely: {}\n", a.to_string()),
+					true,
+				),
 				ClientResponse::TryAgain => {
 					self.send_client(
 						&addr,
-						"no known leader. try again another node another time",
+						"no known leader. try again another node another time\n",
 						true,
 					);
 				}
@@ -351,9 +408,9 @@ where
 		if self.node_streams.get_mut(addr).is_none() {
 			let build = TcpBuilder::new_v4().unwrap();
 			loop {
-				match build.bind(SocketAddr::new(self.my_addr, self.next_port)) {
+				match build.bind(SocketAddr::new(self.my_addr, 0)) {
 					Ok(b) => {
-						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, LISTEN_PORT)) {
+						if let Ok(stream) = b.connect(SocketAddr::new(addr.addr, self.connect_port)) {
 							stream
 								.set_nonblocking(true)
 								.expect("unable to set nonblocking");
@@ -364,7 +421,7 @@ where
 						}
 						break;
 					}
-					Err(_) => self.next_port += 1,
+					Err(_) => (),
 				}
 			}
 		}
@@ -382,24 +439,41 @@ where
 	}
 
 	fn send_client(&mut self, addr: &ClientAddr, msg: &str, close: bool) {
+		println!("sent to client {:?} message: {:?}", addr, msg);
+
 		match self.client_streams.get_mut(addr) {
 			Some(stream) => {
+				let mut to_clean: bool = close || !self.client_fds.get(&stream.as_raw_fd()).unwrap().0;
 				match stream.write_all(msg.as_bytes()) {
 					Ok(_) => {}
-					Err(_) => {}
+					Err(_) => {
+						to_clean = true;
+					}
 				};
-				if close || !self.client_fds.get(&stream.as_raw_fd()).unwrap().0 {
+				println!(
+					"identified stream {:?} with to_clean as: {}",
+					stream.as_raw_fd(),
+					to_clean
+				);
+				if to_clean {
+					println!("removing client from connections");
 					self.client_fds.remove_entry(&stream.as_raw_fd());
 					self.client_streams.remove_entry(addr);
 
 					self.updates.client_updated = true;
 				}
 			}
-			None => panic!("unable to find key for client_streams"),
+			None => {
+				println!("couldn't find client, likely cleaned up.");
+			}
 		}
 	}
 
 	pub fn regenerate_pollfds(&mut self) {
+		println!(
+			"regenerating pollfds with ({},{})",
+			self.updates.client_updated, self.updates.node_updated
+		);
 		match (self.updates.client_updated, self.updates.node_updated) {
 			(false, false) => {}
 			(true, false) => {
